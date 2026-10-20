@@ -3,3 +3,6 @@ node_modules/
 *.log
 dist/
 *.tgz
+
+# Internal security reviews never belong in the repository.
+AUDIT.md
