@@ -27,6 +27,10 @@ agy mcp add agy-agent agy-agent-mcp
 
 If `agy` is not on PATH, add `--env AGY_BIN=/path/to/agy` to any of the above.
 
+OpenCode: pass `--global` to `mcp add` to register once for every project (writes `~/.config/opencode/opencode.json`). Project configs defining the same server name override the global entry, so remove per-project `agy` blocks after switching.
+
+After upgrading the installed package, restart the MCP client or reload its catalog (`opencode api post /api/location/reload -d '{}'` for OpenCode) — sessions spawned before the upgrade keep replaying the old boot failure otherwise.
+
 From a local checkout (`npm install` first): `opencode mcp add agy -- "$(pwd)/bin/mcp.mjs"`.
 
 ## Tools
