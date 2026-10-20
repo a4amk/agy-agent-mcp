@@ -1142,7 +1142,10 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
     result.usage = json.usage as Record<string, unknown>;
   }
   if (Array.isArray(json?.denied_actions)) result.denied_actions = json.denied_actions as unknown[];
-  if (status !== "success") result.exit_code = outcome.exitCode;
+  // The process exit code belongs to EVERY final result, not only to the
+  // failures: the durable receipt is mirrored in full by watch_task, so a
+  // successful run's receipt has to say how the CLI exited (0).
+  result.exit_code = outcome.exitCode;
   if (error) result.error = error;
 
   // Quota upgrade: the same classifier as before, now over error + response +
@@ -1332,7 +1335,17 @@ export function sweepStateDir(): void {
 const MAX_STREAM_CHARS = 200_000;
 const DEFAULT_TAIL_LINES = 400;
 
-export interface WatchTaskReport {
+/**
+ * The watch report: the watch-specific view of a run (liveness, transcript
+ * tail, compact digest) PLUS the COMPLETE final result once the run ended.
+ *
+ * The result part is `Partial<TaskResult>` on purpose: the durable receipt is
+ * merged in WHOLE (see readStreamTail), so every field of the final result is
+ * carried - including the ones that explain a failure (`error`, `notes`,
+ * `exit_code`, `quota_note`, `denied_actions`). A field added to TaskResult
+ * later is carried automatically instead of needing a second edit here.
+ */
+export interface WatchTaskReport extends Partial<TaskResult> {
   found: boolean;
   file?: string;
   bytes?: number;
@@ -1360,14 +1373,52 @@ export interface WatchTaskReport {
   content_len?: number;
   hint?: string;
   candidates?: string[];
-  status?: TaskStatus;
-  response?: string;
-  duration_seconds?: number;
-  usage?: Record<string, unknown>;
-  files_touched?: string[];
-  scope_violations?: string[];
-  progress_bridge?: { token: string | number; notifications: number; mirrored_lines: number };
 }
+
+/**
+ * Every report key that is NOT a result field - i.e. the names the watch
+ * report OWNS. The watcher computes them itself, and they are never taken
+ * from the durable receipt.
+ */
+export type WatchOwnedField = Exclude<keyof WatchTaskReport, keyof TaskResult>;
+
+/**
+ * The watch-owned field names, as the single source of truth for the merge
+ * rule: the receipt is stripped of exactly these names before it is merged
+ * into the report, so a receipt can never overwrite a watch field - not even
+ * one the watcher sets only conditionally (`phase`, `elapsed_seconds`,
+ * `usage_latest`, `clipped`, `hint`, `candidates`), which stay ABSENT when
+ * the transcript does not carry them.
+ */
+export const WATCH_OWN_FIELDS = [
+  "found",
+  "file",
+  "bytes",
+  "modified",
+  "running",
+  "finished",
+  "result_ready",
+  "content",
+  "content_len",
+  "steps",
+  "step_count",
+  "phase",
+  "elapsed_seconds",
+  "usage_latest",
+  "clipped",
+  "hint",
+  "candidates",
+] as const satisfies readonly WatchOwnedField[];
+
+/**
+ * Compile-time proof that WATCH_OWN_FIELDS lists EVERY watch-owned field: a
+ * watch field added to the report without adding it to the constant makes
+ * this type resolve to `never` and the line below stops compiling.
+ */
+export type WatchFieldsComplete =
+  Exclude<WatchOwnedField, (typeof WATCH_OWN_FIELDS)[number]> extends never ? true : never;
+
+export const WATCH_OWN_FIELDS_COMPLETE: WatchFieldsComplete = true;
 
 /**
  * List `task_<id>.stream` file names in `stateDir` sorted most-recent-first
@@ -1507,7 +1558,7 @@ export function readStreamTail(
     content = charLimit > 2 ? `…\n${bodyAfterPrefix.slice(-(charLimit - 2))}` : bodyAfterPrefix.slice(-charLimit);
   }
 
-  const report: WatchTaskReport = {
+  const watchFields: WatchTaskReport = {
     found: true,
     file: filePath,
     bytes: st.size,
@@ -1521,22 +1572,30 @@ export function readStreamTail(
   // The compact digest: one entry per step, so a watching client renders a
   // feed instead of dumping the raw transcript.
   const digest = buildDigest(lines);
-  report.steps = digest.steps;
-  report.step_count = digest.step_count;
-  if (digest.phase) report.phase = digest.phase;
-  if (digest.elapsed_seconds !== undefined) report.elapsed_seconds = digest.elapsed_seconds;
-  if (digest.usage_latest) report.usage_latest = digest.usage_latest;
-  if (clipped) report.clipped = true;
+  watchFields.steps = digest.steps;
+  watchFields.step_count = digest.step_count;
+  if (digest.phase) watchFields.phase = digest.phase;
+  if (digest.elapsed_seconds !== undefined) watchFields.elapsed_seconds = digest.elapsed_seconds;
+  if (digest.usage_latest) watchFields.usage_latest = digest.usage_latest;
+  if (clipped) watchFields.clipped = true;
+
   if (finished && receipt) {
-    if (receipt.status !== undefined) report.status = receipt.status;
-    if (receipt.response !== undefined) report.response = receipt.response;
-    if (receipt.duration_seconds !== undefined) report.duration_seconds = receipt.duration_seconds;
-    if (receipt.usage !== undefined) report.usage = receipt.usage;
-    if (receipt.files_touched !== undefined) report.files_touched = receipt.files_touched;
-    if (receipt.scope_violations !== undefined) report.scope_violations = receipt.scope_violations;
-    if (receipt.progress_bridge !== undefined) report.progress_bridge = receipt.progress_bridge;
+    // The durable receipt IS the complete final result: merge EVERY field of
+    // it into the report, so a failed run says WHY it failed (error, notes,
+    // exit_code, quota_note, denied_actions, ...) instead of only its status.
+    //
+    // The watch-owned names are the watcher's own, so they are stripped from
+    // the receipt FIRST: a receipt (a tampered or foreign one) can never
+    // overwrite them - not even the conditionally-set ones (phase,
+    // elapsed_seconds, usage_latest, clipped, hint, candidates), which stay
+    // absent when the transcript does not carry them.
+    const resultFields: Record<string, unknown> = { ...receipt };
+    for (const key of WATCH_OWN_FIELDS) delete resultFields[key];
+    return { ...resultFields, ...watchFields };
   }
-  return report;
+  // Still running: there is no receipt yet, so the report carries no result
+  // fields at all.
+  return watchFields;
 }
 
 /**
