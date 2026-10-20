@@ -41,7 +41,7 @@ From a local checkout (`npm install` first): `opencode mcp add agy -- "$(pwd)/bi
 | --- | --- |
 | `general_task` | Delegate a general-purpose coding task (`--mode accept-edits`, default `effort: "medium"`) and wait for the full report. |
 | `explore_task` | Delegate a read-only exploration or diagnosis task (`--mode plan`, default `effort: "low"`) and wait for the report. |
-| `watch_task` | Read the live or recent `.stream` transcript (`stream_file` optional, defaults to latest; `tail_lines` `0..2000`, default `400`). |
+| `watch_task` | Read the live or recent `.stream` transcript (`stream_file` optional, defaults to latest; `tail_lines` `0..2000`, default `400`); once the run ends, the report carries the complete final result. |
 | `list_models` | List model IDs accepted by `model`. |
 | `list_agents` | List agent profiles accepted by `agent`. |
 
@@ -60,7 +60,7 @@ Every delegation mirrors live CLI events to `<AGY_MCP_STATE_DIR>/task_<id>.strea
 In MCP clients that do not render MCP progress notifications (such as OpenCode v2.0.22 or Claude Code, where progress notifications are discarded or buffered while tool results render), use the **handle-and-watch workflow**:
 - **Start detached**: pass `background: true` on `general_task` or `explore_task` to start the run in the background and receive a handle immediately (`{ task_id, status: "running", stream_file, transcript_file, started: true, note: "..." }`).
 - **Poll progress**: call `watch_task` with `stream_file: "<task_id>"` (or bare ID / latest) to inspect the live transcript as it grows (`running: true`).
-- **Retrieve final result**: once the run exits, `watch_task` returns `running: false`, `finished: true`, and includes the enriched final result (`status`, `response`, `duration_seconds`, `usage`, `files_touched`, `scope_violations`, and `progress_bridge`).
+- **Retrieve final result**: once the run exits, `watch_task` returns `running: false`, `finished: true`, and carries the **complete** final result — every field of the durable receipt, the same result `general_task`/`explore_task` returns (`status`, `response`, `error`, `notes`, `exit_code`, `usage`, `conversation_id`, `num_turns`, `denied_actions`, `quota_note`, `files_touched`, `scope_violations`, `resume_hint`, …). A failed run therefore says *why* it failed, not just that it failed.
 - **Cancel a detached run**: pass `cancel: true` on `watch_task` to stop a running detached task immediately (kills the child, releases the lock, and reports the run as cancelled).
 - **Read the feed, not the dump**: every `watch_task` report also carries a compact **digest** — `steps` (one entry per completed event: `kind` (`read`/`write`/`run`/`phase`), `label`, `target`, `dur_seconds`, `output`, token usage), plus `step_count`, `phase`, `elapsed_seconds` and `usage_latest`. That is what to render for a live status display; `content` remains the raw transcript tail for detail work.
 

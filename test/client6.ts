@@ -3136,5 +3136,374 @@ const HANDSHAKE = (clientName: string) => ({
   );
 }
 
+// ---------------------------------------------------------------------------
+// 18. watch_task report completeness: the COMPLETE final result
+// ---------------------------------------------------------------------------
+{
+  /** A fake whose CLI reports a failure with a machine-readable error, then exits 3. */
+  const WATCH_FAIL_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"watchfail-c1","init":{"cwd":"/work/watchfail","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"watchfail-c1","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"partial answer","duration_seconds":0.2,"usage":{"total_tokens":7}}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"watchfail-c1","status":"ERROR","response":"","error":"boom: something went wrong","duration_seconds":0.3,"num_turns":1,"usage":{"total_tokens":7}}}'`,
+    `echo "fake agy stderr noise" >&2`,
+    "exit 3",
+  ].join("\n");
+  /** The same fake, but the run succeeds. */
+  const WATCH_OK_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"watchok-c1","init":{"cwd":"/work/watchok","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"watchok-c1","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"all good","duration_seconds":0.2,"usage":{"total_tokens":11}}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"watchok-c1","status":"SUCCESS","response":"all good","duration_seconds":0.3,"num_turns":2,"usage":{"total_tokens":11}}}'`,
+  ].join("\n");
+  const writeFake = (body: string): string => {
+    const bin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+    writeFileSync(bin, `#!/bin/sh\n${body}\n`);
+    chmodSync(bin, 0o755);
+    return bin;
+  };
+
+  /**
+   * One delegation followed by one watch poll over stdio. The delegation has
+   * ended, so its durable receipt exists: the watch report must carry the
+   * COMPLETE final result, not a hand-picked subset of it.
+   */
+  const delegateThenWatch = async (bin: string, stateDir: string, id: number) => {
+    const captured: {
+      delegation: { isError: boolean; body: Record<string, unknown> };
+      watch: { isError: boolean; body: Record<string, unknown> };
+    } = {
+      delegation: { isError: false, body: {} },
+      watch: { isError: false, body: {} },
+    };
+    const { exitCode } = await driveMcpStdio(bin, stateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: id - 1, method: "initialize", params: HANDSHAKE("watch-complete-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(id - 1), `initialize response (id ${id - 1})`);
+      io.send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "watch completeness probe", cwd: stateDir } },
+      });
+      await io.waitUntil(() => !!io.responseFor(id), `delegation response (id ${id})`);
+      const dresp = io.responseFor(id);
+      captured.delegation.isError = dresp?.result?.isError === true;
+      captured.delegation.body = JSON.parse(contentText(dresp, id)) as Record<string, unknown>;
+      const taskId = String(captured.delegation.body.task_id ?? "");
+      if (!taskId) {
+        throw new Error(`the delegation must report a task_id: ${JSON.stringify(captured.delegation.body)}`);
+      }
+      io.send({
+        jsonrpc: "2.0",
+        id: id + 1,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { stream_file: taskId } },
+      });
+      await io.waitUntil(() => !!io.responseFor(id + 1), `watch response (id ${id + 1})`);
+      const wresp = io.responseFor(id + 1);
+      captured.watch.isError = wresp?.result?.isError === true;
+      captured.watch.body = JSON.parse(contentText(wresp, id + 1)) as Record<string, unknown>;
+    });
+    if (exitCode !== 0) {
+      throw new Error(`watch-completeness suite must exit 0, got ${exitCode}`);
+    }
+    return captured;
+  };
+
+  /** Every field of the final result must be in the watch report, unchanged. */
+  const assertCompleteResult = (label: string, delegation: Record<string, unknown>, watch: Record<string, unknown>) => {
+    for (const [key, value] of Object.entries(delegation)) {
+      if (JSON.stringify(watch[key]) !== JSON.stringify(value)) {
+        throw new Error(
+          `(18) ${label}: the watch report must carry ${key}=${JSON.stringify(value)}, got ${JSON.stringify(watch[key])}`
+        );
+      }
+    }
+  };
+
+  // (a) A FAILED run: the watch report carries the failure reason - the CLI's
+  //     own error message, its notes and the process exit code.
+  const failStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-watchfail-"));
+  const failed = await delegateThenWatch(writeFake(WATCH_FAIL_BODY), failStateDir, 402);
+  if (failed.watch.isError !== false) {
+    throw new Error(`(18a) watch_task must not be flagged as an error: ${JSON.stringify(failed.watch.body)}`);
+  }
+  const fw = failed.watch.body;
+  if (fw.status !== "error") {
+    throw new Error(`(18a) the watch report must carry status=error: ${JSON.stringify(fw)}`);
+  }
+  if (fw.error !== "boom: something went wrong") {
+    throw new Error(`(18a) the watch report must carry the CLI's error message: ${JSON.stringify(fw.error)}`);
+  }
+  if (!String(fw.notes ?? "").includes("fake agy stderr noise")) {
+    throw new Error(`(18a) the watch report must carry the CLI's notes: ${JSON.stringify(fw.notes)}`);
+  }
+  if (fw.exit_code !== 3) {
+    throw new Error(`(18a) the watch report must carry the exit code: ${JSON.stringify(fw)}`);
+  }
+  assertCompleteResult("18a", failed.delegation.body, fw);
+
+  // (b) A SUCCESSFUL run: the watch report carries the COMPLETE result.
+  const okStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-watchok-"));
+  const ok = await delegateThenWatch(writeFake(WATCH_OK_BODY), okStateDir, 404);
+  if (ok.watch.isError !== false) {
+    throw new Error(`(18b) watch_task must not be flagged as an error: ${JSON.stringify(ok.watch.body)}`);
+  }
+  const ow = ok.watch.body;
+  if (ow.status !== "success" || ow.error !== undefined) {
+    throw new Error(`(18b) the watch report must carry the successful status: ${JSON.stringify(ow)}`);
+  }
+  for (const key of [
+    "task_id",
+    "status",
+    "response",
+    "duration_seconds",
+    "usage",
+    "conversation_id",
+    "num_turns",
+    "cwd",
+    "prompt",
+    "auto_approve_applied",
+    "resume_hint",
+    "exit_code",
+    "transcript_file",
+    "stream_file",
+  ]) {
+    if (ow[key] === undefined) {
+      throw new Error(`(18b) the watch report must carry ${key}: ${JSON.stringify(ow)}`);
+    }
+  }
+  if (ow.response !== "all good" || ow.conversation_id !== "watchok-c1" || ow.num_turns !== 2) {
+    throw new Error(`(18b) the watch report must carry the CLI's result fields: ${JSON.stringify(ow)}`);
+  }
+  if (ow.exit_code !== 0) {
+    throw new Error(`(18b) the watch report must carry the exit code of a successful run: ${JSON.stringify(ow)}`);
+  }
+  assertCompleteResult("18b", ok.delegation.body, ow);
+
+  // (c) The watch-specific fields are still there, with their own types and
+  //     values - the result does not clobber them.
+  for (const report of [fw, ow]) {
+    for (const key of [
+      "found",
+      "file",
+      "bytes",
+      "modified",
+      "running",
+      "finished",
+      "result_ready",
+      "content",
+      "content_len",
+      "steps",
+      "step_count",
+      "phase",
+      "elapsed_seconds",
+      "usage_latest",
+    ]) {
+      if (report[key] === undefined) {
+        throw new Error(`(18c) the watch report must carry ${key}: ${JSON.stringify(report)}`);
+      }
+    }
+    if (report.found !== true || report.running !== false || report.finished !== true || report.result_ready !== true) {
+      throw new Error(`(18c) the watch report must classify the finished run: ${JSON.stringify(report)}`);
+    }
+    if (
+      typeof report.content !== "string" ||
+      !Array.isArray(report.steps) ||
+      report.step_count !== report.steps.length
+    ) {
+      throw new Error(`(18c) the watch fields must keep their types: ${JSON.stringify(report)}`);
+    }
+    if (report.phase !== "agent_response" || report.elapsed_seconds !== 0.3) {
+      throw new Error(`(18c) the digest must survive the merge: ${JSON.stringify(report)}`);
+    }
+  }
+
+  // (d) Unit level: the receipt is merged WHOLE and can never clobber a
+  //     watch-specific field; a run without a receipt carries NO result fields.
+  const mergeDir = mkdtempSync(path.join(os.tmpdir(), "agy-watchmerge-"));
+  const mergeStream = path.join(mergeDir, "task_merge01.stream");
+  const mergeReceipt = path.join(mergeDir, "task_merge01.ndjson");
+  writeFileSync(
+    mergeStream,
+    `${[
+      "session open · cwd=/work · permission_mode=accept-edits · tools=1",
+      "● agent_response",
+      "  ⎿ done in 0.5s · 3 tokens",
+      "== done: status=ERROR · 0.5s",
+    ].join("\n")}\n`
+  );
+  writeFileSync(
+    mergeReceipt,
+    `${JSON.stringify({
+      ts: Date.now(),
+      event: "result",
+      result: {
+        task_id: "task_merge01",
+        status: "error",
+        error: "boom: merge probe",
+        notes: "stderr noise",
+        exit_code: 3,
+        conversation_id: "merge-c1",
+        num_turns: 2,
+        usage: { total_tokens: 3 },
+        denied_actions: ["run_command"],
+        response: "",
+        prompt: "merge probe",
+        cwd: "/work",
+        auto_approve_applied: false,
+        transcript_file: mergeReceipt,
+        stream_file: mergeStream,
+        // A receipt that tries to overwrite the watch-owned fields:
+        found: false,
+        running: true,
+        finished: false,
+        result_ready: false,
+        content: "hijacked",
+        content_len: 999,
+        file: "/etc/passwd",
+        bytes: 0,
+        modified: "1999-01-01T00:00:00.000Z",
+        steps: [],
+        step_count: 99,
+        phase: "hijack",
+        elapsed_seconds: -1,
+        usage_latest: { total_tokens: 999 },
+        clipped: true,
+        hint: "hijack",
+        candidates: ["hijack"],
+      },
+    })}\n`
+  );
+  const merged = runner.readStreamTail(mergeStream);
+  if (
+    merged.found !== true ||
+    merged.running !== false ||
+    merged.finished !== true ||
+    merged.result_ready !== true ||
+    merged.file !== mergeStream ||
+    merged.content === "hijacked" ||
+    typeof merged.bytes !== "number" ||
+    merged.bytes <= 0 ||
+    !Array.isArray(merged.steps) ||
+    merged.steps.length !== 1 ||
+    merged.step_count !== 1
+  ) {
+    throw new Error(`(18d) a receipt must never clobber the watch-specific fields: ${JSON.stringify(merged)}`);
+  }
+  // The conditionally-set watch fields keep the WATCHER's values, never the
+  // receipt's - and the ones the transcript does not carry stay ABSENT (the
+  // key is not even present, so a consumer can tell "absent" from "empty").
+  if (
+    merged.phase !== "agent_response" ||
+    merged.elapsed_seconds !== 0.5 ||
+    JSON.stringify(merged.usage_latest) !== JSON.stringify({ total_tokens: 3 }) ||
+    merged.content_len !== (merged.content ?? "").length ||
+    merged.modified === "1999-01-01T00:00:00.000Z"
+  ) {
+    throw new Error(`(18d) the watch fields must keep the watcher's own values: ${JSON.stringify(merged)}`);
+  }
+  for (const key of ["clipped", "hint", "candidates"]) {
+    if (Object.hasOwn(merged, key)) {
+      throw new Error(`(18d) ${key} must be absent when the transcript does not carry it: ${JSON.stringify(merged)}`);
+    }
+  }
+  if (
+    merged.error !== "boom: merge probe" ||
+    merged.notes !== "stderr noise" ||
+    merged.exit_code !== 3 ||
+    merged.conversation_id !== "merge-c1" ||
+    merged.num_turns !== 2 ||
+    merged.task_id !== "task_merge01" ||
+    merged.cwd !== "/work" ||
+    merged.prompt !== "merge probe" ||
+    merged.auto_approve_applied !== false ||
+    merged.transcript_file !== mergeReceipt ||
+    merged.stream_file !== mergeStream ||
+    JSON.stringify(merged.usage) !== JSON.stringify({ total_tokens: 3 }) ||
+    JSON.stringify(merged.denied_actions) !== JSON.stringify(["run_command"])
+  ) {
+    throw new Error(`(18d) the whole receipt must be carried: ${JSON.stringify(merged)}`);
+  }
+
+  // (18e) The same hostile receipt against a transcript WITHOUT phase markers:
+  //      the watch fields that the watcher does not compute must be ABSENT
+  //      (not undefined-valued) even though the receipt injects them.
+  const bareStream = path.join(mergeDir, "task_merge03.stream");
+  const bareReceipt = path.join(mergeDir, "task_merge03.ndjson");
+  writeFileSync(bareStream, "session open · cwd=/work · permission_mode=accept-edits · tools=1\n");
+  writeFileSync(
+    bareReceipt,
+    `${JSON.stringify({
+      ts: Date.now(),
+      event: "result",
+      result: {
+        task_id: "task_merge03",
+        status: "success",
+        response: "ok",
+        duration_seconds: 1,
+        phase: "hijack",
+        elapsed_seconds: -1,
+        usage_latest: { total_tokens: 999 },
+        clipped: true,
+        hint: "hijack",
+        candidates: ["hijack"],
+        content: "hijacked",
+        content_len: 999,
+        found: false,
+        running: true,
+        finished: false,
+        result_ready: false,
+        file: "/etc/passwd",
+        bytes: 0,
+        modified: "1999-01-01T00:00:00.000Z",
+        steps: [],
+        step_count: 99,
+      },
+    })}\n`
+  );
+  const bare = runner.readStreamTail(bareStream);
+  for (const key of ["phase", "elapsed_seconds", "usage_latest", "clipped", "hint", "candidates"]) {
+    if (Object.hasOwn(bare, key)) {
+      throw new Error(`(18e) ${key} must be absent, not taken from the receipt: ${JSON.stringify(bare)}`);
+    }
+  }
+  if (
+    bare.found !== true ||
+    bare.running !== false ||
+    bare.finished !== true ||
+    bare.result_ready !== true ||
+    bare.file !== bareStream ||
+    bare.content === "hijacked" ||
+    bare.content_len !== (bare.content ?? "").length ||
+    typeof bare.bytes !== "number" ||
+    bare.bytes <= 0 ||
+    bare.step_count !== 0
+  ) {
+    throw new Error(`(18e) a receipt must never clobber the watch-specific fields: ${JSON.stringify(bare)}`);
+  }
+  // The result fields are still carried in full.
+  if (bare.task_id !== "task_merge03" || bare.status !== "success" || bare.response !== "ok") {
+    throw new Error(`(18e) the receipt's result fields must still be carried: ${JSON.stringify(bare)}`);
+  }
+
+  const runningStream = path.join(mergeDir, "task_run0002.stream");
+  writeFileSync(runningStream, "session open · cwd=/work · permission_mode=accept-edits · tools=1\n● agent_response\n");
+  const runningReport = runner.readStreamTail(runningStream);
+  if (runningReport.running !== true || runningReport.result_ready !== false) {
+    throw new Error(
+      `(18d) a run without a receipt must still be reported as running: ${JSON.stringify(runningReport)}`
+    );
+  }
+  for (const key of ["status", "response", "error", "notes", "exit_code", "task_id", "conversation_id", "usage"]) {
+    if (runningReport[key] !== undefined) {
+      throw new Error(`(18d) a running task must carry no result field (${key}): ${JSON.stringify(runningReport)}`);
+    }
+  }
+
+  console.log(
+    "watch_task completeness: a failed run's watch report carries the CLI's error message, its notes and the exit code, a successful run's carries the complete result, the watch-owned fields are never clobbered by a hostile receipt (the conditional ones stay absent), and a running task still carries no result fields: ok"
+  );
+}
+
 closeSync(0);
 console.log("=== OFFLINE TESTS PASS ===");
