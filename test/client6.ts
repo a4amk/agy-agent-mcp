@@ -51,6 +51,15 @@
  *     argument anywhere, mirrored lines match the on-disk .stream transcript,
  *     and stdout outside the framing/stream/result block is whitespace-only;
  *     the failure path exits 1 with a non-success status.
+ * 12. Verified audit fixes (A1, A6, X1, F1):
+ *     - hash-based touch detection: file dirty before run and modified during it
+ *       is reported in files_touched (and scope_violations);
+ *     - exit-fallback hygiene: stdio destroyed and data listeners detached on
+ *       fallback settle, so no idle timer is re-armed;
+ *     - cancellation over stdio: notifications/cancelled for in-flight request
+ *       kills child and releases lock so next delegation is accepted;
+ *     - follow CLI argument parsing: bare -- end-of-options delimiter forwards
+ *       prompt containing -- verbatim to the agent.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -61,6 +70,9 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -1784,6 +1796,417 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     `follow CLI: success exit ${ok.code}/failure exit ${bad.code}, ${mirrored.length} mirrored stream lines pre-marker + parsed result JSON after, stderr banner-only, --model pair without --effort, stdout pure: ok`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 12. Verified audit fixes (A1, A6, X1, F1)
+// ---------------------------------------------------------------------------
+{
+  // 12a. Hash-based touch detection (A1):
+  // A file already dirty before the run whose contents change during it must be
+  // reported in files_touched (and scope_violations if out of scope).
+  const auditRepo = mkdtempSync(path.join(os.tmpdir(), "agy-audit-a1-"));
+  try {
+    spawnSync("git", ["init", auditRepo]);
+    writeFileSync(path.join(auditRepo, "clean.txt"), "clean\n");
+    writeFileSync(path.join(auditRepo, "dirty-changed.txt"), "v1\n");
+    writeFileSync(path.join(auditRepo, "dirty-unchanged.txt"), "same\n");
+    writeFileSync(path.join(auditRepo, "dirty-committed.txt"), "c1\n");
+    writeFileSync(path.join(auditRepo, "clean-deleted.txt"), "to-be-deleted\n");
+    writeFileSync(path.join(auditRepo, "symlink-target1.txt"), "t1\n");
+    writeFileSync(path.join(auditRepo, "symlink-target2.txt"), "t2\n");
+    symlinkSync("symlink-target1.txt", path.join(auditRepo, "test-symlink"));
+    spawnSync("git", ["-C", auditRepo, "add", "."]);
+    spawnSync("git", ["-C", auditRepo, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "init"]);
+
+    // Make files dirty before the run
+    writeFileSync(path.join(auditRepo, "dirty-changed.txt"), "v2-dirty-before\n");
+    writeFileSync(path.join(auditRepo, "dirty-unchanged.txt"), "same-dirty-before\n");
+    writeFileSync(path.join(auditRepo, "dirty-committed.txt"), "c2-dirty-before\n");
+
+    const snapA1 = runner.captureFilesBefore(auditRepo);
+    if (snapA1 === null) throw new Error("(12a) captureFilesBefore returned null");
+
+    // During the run:
+    // 1. modify dirty-changed.txt (dirty-unchanged.txt is untouched)
+    writeFileSync(path.join(auditRepo, "dirty-changed.txt"), "v3-dirty-during\n");
+    // 2. commit dirty-committed.txt (becomes clean in git status)
+    spawnSync("git", ["-C", auditRepo, "add", "dirty-committed.txt"]);
+    spawnSync("git", ["-C", auditRepo, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "commit dirty"]);
+    // 3. delete clean-deleted.txt
+    unlinkSync(path.join(auditRepo, "clean-deleted.txt"));
+    // 4. change symlink target
+    unlinkSync(path.join(auditRepo, "test-symlink"));
+    symlinkSync("symlink-target2.txt", path.join(auditRepo, "test-symlink"));
+
+    const auditRes = runner.auditTaskFiles({ cwd: auditRepo, filesBefore: snapA1, editScope: ["clean.txt"] });
+    if (!auditRes?.files_touched.includes("dirty-changed.txt")) {
+      throw new Error(`(12a) files_touched missing pre-dirty changed file: ${JSON.stringify(auditRes?.files_touched)}`);
+    }
+    if (auditRes.files_touched.includes("dirty-unchanged.txt")) {
+      throw new Error(
+        `(12a) files_touched must omit pre-dirty unchanged file: ${JSON.stringify(auditRes.files_touched)}`
+      );
+    }
+    if (!auditRes.scope_violations?.includes("dirty-changed.txt")) {
+      throw new Error(
+        `(12a) scope_violations missing pre-dirty changed file: ${JSON.stringify(auditRes.scope_violations)}`
+      );
+    }
+    if (!auditRes.files_touched.includes("dirty-committed.txt")) {
+      throw new Error(
+        `(12a) files_touched missing pre-dirty file committed during run: ${JSON.stringify(auditRes.files_touched)}`
+      );
+    }
+    if (!auditRes.files_touched.includes("clean-deleted.txt")) {
+      throw new Error(`(12a) files_touched missing file deleted during run: ${JSON.stringify(auditRes.files_touched)}`);
+    }
+    if (!auditRes.files_touched.includes("test-symlink")) {
+      throw new Error(`(12a) files_touched missing modified symlink: ${JSON.stringify(auditRes.files_touched)}`);
+    }
+
+    // Verify 5 MB fallback threshold (large file)
+    const bigFile = "big-dirty.bin";
+    const bigPath = path.join(auditRepo, bigFile);
+    writeFileSync(bigPath, Buffer.alloc(5 * 1024 * 1024 + 10, 1));
+    const snapBig = runner.captureFilesBefore(auditRepo);
+    if (snapBig === null) throw new Error("(12a) captureFilesBefore for big file returned null");
+    // Change size during run
+    writeFileSync(bigPath, Buffer.alloc(5 * 1024 * 1024 + 20, 2));
+    const auditBig = runner.auditTaskFiles({ cwd: auditRepo, filesBefore: snapBig });
+    if (!auditBig?.files_touched.includes(bigFile)) {
+      throw new Error(`(12a) large dirty file touched not detected: ${JSON.stringify(auditBig?.files_touched)}`);
+    }
+  } finally {
+    rmSync(auditRepo, { recursive: true, force: true });
+  }
+
+  // 12b. Exit-fallback hygiene (A6):
+  // When the child process exits but a descendant holds stdio open, the 2s
+  // exit fallback settles the task and destroys stdio streams so no idle timer
+  // can re-arm.
+  const FALLBACK_PROBE_SCRIPT = `
+    import * as runner from "./src/agy.ts";
+    const t0 = Date.now();
+    const result = await runner.runTask({
+      prompt: "fallback probe",
+      cwd: process.cwd(),
+      timeoutMs: 400,
+    });
+    const elapsed = Date.now() - t0;
+    await new Promise((r) => setTimeout(r, 1200));
+    process.stdout.write(JSON.stringify({ result, elapsed }));
+    process.exit(0);
+  `;
+  const fbDir = mkdtempSync(path.join(os.tmpdir(), "agy-fb-"));
+  const fbBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  try {
+    writeFileSync(
+      fbBin,
+      [
+        "#!/bin/sh",
+        "(",
+        "  sleep 2.5",
+        '  echo "descendant late chatter"',
+        ") &",
+        `echo "$!" > "${path.join(fbDir, "descendant.pid")}"`,
+        `printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"quick","duration_seconds":0.1}}'`,
+        "exit 0",
+      ].join("\n") + "\n"
+    );
+    chmodSync(fbBin, 0o755);
+
+    const fbRes = await execFileP(process.execPath, ["--input-type=module", "-e", FALLBACK_PROBE_SCRIPT], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        AGY_BIN: fbBin,
+        AGY_MCP_STATE_DIR: fbDir,
+      },
+      timeout: 10_000,
+    });
+    const fbOut = JSON.parse(fbRes.stdout) as {
+      result: { status: string; error?: string };
+      elapsed: number;
+    };
+    if (fbOut.result.status !== "success") {
+      throw new Error(`(12b) exit-fallback task failed: ${fbOut.result.status} error: ${fbOut.result.error}`);
+    }
+    if (fbOut.elapsed < 1800) {
+      throw new Error(`(12b) exit-fallback must wait ~2s before settling, took ${fbOut.elapsed}ms`);
+    }
+  } finally {
+    try {
+      const pidFile = path.join(fbDir, "descendant.pid");
+      if (existsSync(pidFile)) {
+        const dPid = parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+        if (dPid > 0) process.kill(dPid, "SIGKILL");
+      }
+    } catch {
+      /* process already exited */
+    }
+    rmSync(fbDir, { recursive: true, force: true });
+    try {
+      unlinkSync(fbBin);
+    } catch {
+      /* ignore unlink error */
+    }
+  }
+
+  // 12c. Cancellation support (X1):
+  // notifications/cancelled for the in-flight request kills the child and releases
+  // the lock, so a subsequent delegation is accepted rather than rejected.
+  const cancelDir = mkdtempSync(path.join(os.tmpdir(), "agy-cancel-"));
+  const cancelPidfile = path.join(cancelDir, "pid.txt");
+  const cancelAgyBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(
+    cancelAgyBin,
+    ["#!/bin/sh", `printf '%s\\n' "$$" > "${cancelPidfile}"`, SLOW_STREAM_BODY].join("\n") + "\n"
+  );
+  chmodSync(cancelAgyBin, 0o755);
+
+  try {
+    await driveMcpStdio(cancelAgyBin, cancelDir, async (io) => {
+      io.send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: HANDSHAKE("cancel-probe"),
+      });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "initialize response");
+
+      // Launch first delegation (id 50)
+      io.send({
+        jsonrpc: "2.0",
+        id: 50,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "task to cancel", cwd: cancelDir } },
+      });
+
+      // Wait for task 50 to spawn and start streaming
+      await io.waitUntil(
+        () => existsSync(cancelPidfile) && readdirSync(cancelDir).some((f) => /^task_.+\.stream$/.test(f)),
+        "task 50 start and stream creation"
+      );
+
+      io.send({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "watch_task", arguments: {} } });
+      await io.waitUntil(() => !!io.responseFor(51), "watch response 51");
+      const watch51 = JSON.parse(contentText(io.responseFor(51), 51)) as { running?: boolean };
+      if (watch51.running !== true) {
+        throw new Error(`(12c) task 50 should be running, got: ${JSON.stringify(watch51)}`);
+      }
+
+      // Cancellation for an unknown / unrelated request id is ignored
+      io.send({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: 99999 },
+      });
+
+      // Send cancellation for id 50
+      io.send({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: 50 },
+      });
+
+      // Immediately send second delegation (id 52)
+      io.send({
+        jsonrpc: "2.0",
+        id: 52,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "second task after cancel", cwd: cancelDir } },
+      });
+
+      // Wait for response 50: must be answered (not hung) and reflect termination
+      await io.waitUntil(() => !!io.responseFor(50), "cancelled task 50 response");
+      const resp50 = io.responseFor(50);
+      const text50 = contentText(resp50, 50);
+      if (!text50.includes("cancelled") && !text50.includes("signal") && resp50?.result?.isError !== true) {
+        throw new Error(`(12c) task 50 response should reflect cancellation: ${JSON.stringify(resp50)}`);
+      }
+
+      // Prove that task 50 child process was actually terminated
+      await assertPidGone(cancelPidfile, "cancelled task 50 child process");
+
+      // Wait for response 52: must succeed (not rejected with "another delegation is already running")
+      await io.waitUntil(() => !!io.responseFor(52), "delegation 52 response");
+      const resp52 = io.responseFor(52);
+      if (resp52?.result?.isError === true) {
+        throw new Error(`(12c) task 52 was rejected under lock; cancellation failed: ${JSON.stringify(resp52)}`);
+      }
+      const text52 = contentText(resp52, 52);
+      if (text52.includes("another delegation is already running")) {
+        throw new Error(`(12c) task 52 hit single-flight lock rejection: ${text52}`);
+      }
+
+      // Cancellation arriving after run finished is harmless
+      io.send({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: 52 },
+      });
+
+      // Ensure no spurious response was answered for notifications/cancelled
+      const spurious = io.parsed().find((p) => p.id === undefined && ("result" in p || "error" in p));
+      if (spurious) {
+        throw new Error(`(12c) notification must receive no response, got: ${JSON.stringify(spurious)}`);
+      }
+    });
+  } finally {
+    rmSync(cancelDir, { recursive: true, force: true });
+    try {
+      unlinkSync(cancelAgyBin);
+    } catch {
+      /* ignore unlink error */
+    }
+  }
+
+  // 12d. POSIX -- delimiter in follow CLI (F1):
+  // Prompt containing -- reaches the agent verbatim, and options before -- are parsed normally.
+  const followDelimDir = mkdtempSync(path.join(os.tmpdir(), "agy-follow-delim-"));
+  const quickBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  try {
+    writeFileSync(
+      quickBin,
+      [
+        "#!/bin/sh",
+        argCap,
+        `printf '%s\\n' '{"event":"init","conversation_id":"f-quick","init":{"cwd":"/work","tools":[],"permission_mode":"plan"}}'`,
+        `printf '%s\\n' '{"event":"result","result":{"conversation_id":"f-quick","status":"SUCCESS","response":"ok","duration_seconds":0.1}}'`,
+      ].join("\n") + "\n"
+    );
+    chmodSync(quickBin, 0o755);
+
+    const spawnFollowLocal = (
+      stateDir: string,
+      agyBin: string,
+      args: string[]
+    ): Promise<{ code: number; stdout: string; stderr: string }> => {
+      const argfile = path.join(stateDir, "argv.txt");
+      return new Promise((resolve) => {
+        const child = spawn(process.execPath, ["dist/follow.js", ...args], {
+          cwd: ROOT,
+          env: {
+            ...process.env,
+            AGY_BIN: agyBin,
+            AGY_MCP_STATE_DIR: stateDir,
+            AGY_FAKE_ARGFILE: argfile,
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        let stdoutText = "";
+        let stderrText = "";
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (d: string) => {
+          stdoutText += d;
+        });
+        child.stderr.on("data", (d: string) => {
+          stderrText += d;
+        });
+        const killer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+        killer.unref?.();
+        child.on("exit", (code) => {
+          clearTimeout(killer);
+          resolve({ code: code ?? -999, stdout: stdoutText, stderr: stderrText });
+        });
+      });
+    };
+
+    const followDelimRes = await spawnFollowLocal(followDelimDir, quickBin, [
+      "--cwd",
+      followDelimDir,
+      "--",
+      "run",
+      "tests",
+      "--",
+      "--watch",
+      "prompt-end",
+    ]);
+    if (followDelimRes.code !== 0) {
+      throw new Error(`(12d) follow CLI with -- failed: code ${followDelimRes.code}\nstderr: ${followDelimRes.stderr}`);
+    }
+    const followArgv = readArgv(path.join(followDelimDir, "argv.txt"));
+    const promptIdx = followArgv.indexOf("-p");
+    if (promptIdx < 0) {
+      throw new Error(`(12d) fake agy argv missing -p: ${followArgv.join(" ")}`);
+    }
+    const passedPrompt = followArgv[promptIdx + 1];
+    const wantPrompt = "run tests -- --watch prompt-end";
+    if (passedPrompt !== wantPrompt) {
+      throw new Error(
+        `(12d) prompt with -- delimiter mismatch: got ${JSON.stringify(passedPrompt)}, want ${JSON.stringify(wantPrompt)}`
+      );
+    }
+
+    // Also verify that an unknown option before -- is rejected with exit 2
+    const badOptRes = await spawnFollowLocal(followDelimDir, quickBin, ["--unknown-opt", "value", "--", "prompt"]);
+    if (badOptRes.code !== 2) {
+      throw new Error(`(12d) follow CLI must reject unknown option before -- with exit 2, got ${badOptRes.code}`);
+    }
+    if (!badOptRes.stderr.includes("unknown option: --unknown-opt")) {
+      throw new Error(`(12d) follow CLI stderr must report unknown option: ${badOptRes.stderr}`);
+    }
+
+    // 12e. Model and effort are two separate knobs: a bare model id plus
+    // --effort reaches agy verbatim, and a model id that already carries a
+    // tier must not repeat a different effort (refused locally, before any
+    // spawn).
+    const modelEffortRes = await spawnFollowLocal(followDelimDir, quickBin, [
+      "--model",
+      "gemini-3.8-flash",
+      "--effort",
+      "high",
+      "--cwd",
+      followDelimDir,
+      "prompt",
+    ]);
+    if (modelEffortRes.code !== 0) {
+      throw new Error(
+        `(12e) follow CLI with --model/--effort failed: code ${modelEffortRes.code}\nstderr: ${modelEffortRes.stderr}`
+      );
+    }
+    const modelEffortArgv = readArgv(path.join(followDelimDir, "argv.txt"));
+    const modelIdx = modelEffortArgv.indexOf("--model");
+    const effortIdx = modelEffortArgv.indexOf("--effort");
+    if (modelIdx < 0 || modelEffortArgv[modelIdx + 1] !== "gemini-3.8-flash") {
+      throw new Error(`(12e) fake agy argv missing --model gemini-3.8-flash: ${modelEffortArgv.join(" ")}`);
+    }
+    if (effortIdx < 0 || modelEffortArgv[effortIdx + 1] !== "high") {
+      throw new Error(`(12e) fake agy argv missing --effort high: ${modelEffortArgv.join(" ")}`);
+    }
+
+    const tierConflictRes = await spawnFollowLocal(followDelimDir, quickBin, [
+      "--model",
+      "gemini-3.8-flash-high",
+      "--effort",
+      "low",
+      "--cwd",
+      followDelimDir,
+      "prompt",
+    ]);
+    if (tierConflictRes.code !== 2) {
+      throw new Error(
+        `(12e) follow CLI must reject a tier-carrying model with a different --effort, got exit ${tierConflictRes.code}`
+      );
+    }
+    if (!tierConflictRes.stderr.includes("conflicts with --effort")) {
+      throw new Error(`(12e) follow CLI stderr must explain the tier conflict: ${tierConflictRes.stderr}`);
+    }
+  } finally {
+    rmSync(followDelimDir, { recursive: true, force: true });
+    try {
+      unlinkSync(quickBin);
+    } catch {
+      /* ignore unlink error */
+    }
+  }
+
+  console.log(
+    "verified audit fixes: hash-based touch detection, exit-fallback hygiene, cancellation lock release, -- CLI delimiter: ok"
   );
 }
 

@@ -73,7 +73,7 @@ Created /tmp/probe/hello.txt with the word probe.
 ### Live-follow companion CLI
 
 ```sh
-npx agy-agent-follow --model gemini-3.8-flash-medium "summarize the open TODOs in src/ in one paragraph"
+npx agy-agent-follow --model gemini-3.8-flash --effort high "summarize the open TODOs in src/ in one paragraph"
 ```
 
 - Delegates through the same runner as the MCP tools; every mirrored transcript line is printed to stdout as it is written, with the machine-readable result JSON right before exit (exit code `0` only on `status: "success"`).

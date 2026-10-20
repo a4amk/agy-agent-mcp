@@ -23,7 +23,7 @@
             },
             "model": {
               "type": "string",
-              "description": "Model for the task, e.g. gemini-3.8-flash-medium, claude-opus-5-5-high (see list_models)"
+              "description": "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field) or a tier-carrying id such as gemini-3.8-flash-high (see list_models). Never combine a tier-carrying id with a different effort - the agy CLI rejects that combination."
             },
             "agent": {
               "type": "string",
@@ -106,7 +106,7 @@
             },
             "model": {
               "type": "string",
-              "description": "Model for the task, e.g. gemini-3.8-flash-medium, claude-opus-5-5-high (see list_models)"
+              "description": "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field) or a tier-carrying id such as gemini-3.8-flash-high (see list_models). Never combine a tier-carrying id with a different effort - the agy CLI rejects that combination."
             },
             "agent": {
               "type": "string",
