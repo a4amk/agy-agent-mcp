@@ -1275,6 +1275,15 @@ export interface WatchTaskReport {
    * first) - so poll on result_ready, not on finished, to get the result.
    */
   result_ready?: boolean;
+  /** Compact digest of the run so far: one entry per step, not a text dump. */
+  steps?: DigestStep[];
+  step_count?: number;
+  /** The last phase marker seen in the transcript (e.g. "agent_response"). */
+  phase?: string;
+  /** Total run duration, once the transcript carries the "== done:" line. */
+  elapsed_seconds?: number;
+  /** Token usage reported by the most recent completed step. */
+  usage_latest?: { total_tokens?: number; thinking_tokens?: number };
   clipped?: true;
   content?: string;
   content_len?: number;
@@ -1438,6 +1447,14 @@ export function readStreamTail(
     content,
     content_len: content.length,
   };
+  // The compact digest: one entry per step, so a watching client renders a
+  // feed instead of dumping the raw transcript.
+  const digest = buildDigest(lines);
+  report.steps = digest.steps;
+  report.step_count = digest.step_count;
+  if (digest.phase) report.phase = digest.phase;
+  if (digest.elapsed_seconds !== undefined) report.elapsed_seconds = digest.elapsed_seconds;
+  if (digest.usage_latest) report.usage_latest = digest.usage_latest;
   if (clipped) report.clipped = true;
   if (finished && receipt) {
     if (receipt.status !== undefined) report.status = receipt.status;
@@ -1449,6 +1466,108 @@ export function readStreamTail(
     if (receipt.progress_bridge !== undefined) report.progress_bridge = receipt.progress_bridge;
   }
   return report;
+}
+
+/**
+ * One compact step of a run, parsed out of the human-readable transcript:
+ * what the sub-agent did, what it touched, how long it took and what it
+ * cost. This is the digest a watching client renders - the raw transcript
+ * stays available as `content`.
+ */
+export interface DigestStep {
+  /** read (a file read), write (a file edit), run (a command), phase (a turn). */
+  kind: "read" | "write" | "run" | "phase";
+  /** The tool or phase label, e.g. "Read", "agent_response". */
+  label?: string;
+  /** What was touched or executed, when the step names one. */
+  target?: string;
+  dur_seconds?: number;
+  /** Short excerpt of the step output, when there was any. */
+  output?: string;
+  total_tokens?: number;
+  thinking_tokens?: number;
+}
+
+const DIGEST_OUTPUT_CHARS = 120;
+
+/**
+ * Parse the mirrored transcript into a compact step list. The runner renders
+ * one line per event: "→ Read <path>" / "← Write <path>" / "$ <command>" /
+ * "● <phase>", each followed by a "⎿ …done in <dur>s" completion line that
+ * carries the output excerpt and the token usage.
+ */
+export function buildDigest(lines: string[]): {
+  steps: DigestStep[];
+  step_count: number;
+  phase?: string;
+  elapsed_seconds?: number;
+  usage_latest?: { total_tokens?: number; thinking_tokens?: number };
+} {
+  const steps: DigestStep[] = [];
+  let pending: DigestStep | null = null;
+  let phase: string | undefined;
+  let elapsed_seconds: number | undefined;
+  let usage_latest: { total_tokens?: number; thinking_tokens?: number } | undefined;
+
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith("→ ") || line.startsWith("← ")) {
+      const kind = line.startsWith("→ ") ? "read" : "write";
+      const rest = line.slice(2).trim();
+      const sp = rest.indexOf(" ");
+      pending = {
+        kind,
+        label: sp > 0 ? rest.slice(0, sp) : rest,
+        ...(sp > 0 ? { target: rest.slice(sp + 1).trim() } : {}),
+      };
+      continue;
+    }
+    if (line.startsWith("$ ")) {
+      pending = { kind: "run", target: line.slice(2).trim() };
+      continue;
+    }
+    if (line.startsWith("● ")) {
+      const rest = line.slice(2).trim();
+      const sp = rest.indexOf(" ");
+      const label = sp > 0 ? rest.slice(0, sp) : rest;
+      phase = label;
+      pending = { kind: "phase", label, ...(sp > 0 ? { target: rest.slice(sp + 1).trim() } : {}) };
+      continue;
+    }
+    if (line.startsWith("== done:")) {
+      const dur = line.match(/·\s*([\d.]+)s/);
+      if (dur) elapsed_seconds = Number(dur[1]);
+      continue;
+    }
+    if (line.trimStart().startsWith("⎿") && pending) {
+      const dur = line.match(/done in ([\d.]+)s/);
+      const tokens = line.match(/·\s*(\d+)\s*tokens/);
+      const thinking = line.match(/thinking\s+(\d+)/);
+      const output = line
+        .replace(/^[\s⎿]+/, "")
+        .replace(/\s*·?\s*done in [\d.]+s.*$/, "")
+        .trim();
+      if (dur) pending.dur_seconds = Number(dur[1]);
+      if (tokens) pending.total_tokens = Number(tokens[1]);
+      if (thinking) pending.thinking_tokens = Number(thinking[1]);
+      if (output) pending.output = output.slice(0, DIGEST_OUTPUT_CHARS);
+      if (pending.total_tokens !== undefined || pending.thinking_tokens !== undefined) {
+        usage_latest = {
+          ...(pending.total_tokens !== undefined ? { total_tokens: pending.total_tokens } : {}),
+          ...(pending.thinking_tokens !== undefined ? { thinking_tokens: pending.thinking_tokens } : {}),
+        };
+      }
+      steps.push(pending);
+      pending = null;
+    }
+  }
+  return {
+    steps,
+    step_count: steps.length,
+    ...(phase ? { phase } : {}),
+    ...(elapsed_seconds !== undefined ? { elapsed_seconds } : {}),
+    ...(usage_latest ? { usage_latest } : {}),
+  };
 }
 
 /**

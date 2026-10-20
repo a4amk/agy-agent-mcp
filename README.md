@@ -58,6 +58,7 @@ In MCP clients that do not render MCP progress notifications (such as OpenCode v
 - **Poll progress**: call `watch_task` with `stream_file: "<task_id>"` (or bare ID / latest) to inspect the live transcript as it grows (`running: true`).
 - **Retrieve final result**: once the run exits, `watch_task` returns `running: false`, `finished: true`, and includes the enriched final result (`status`, `response`, `duration_seconds`, `usage`, `files_touched`, `scope_violations`, and `progress_bridge`).
 - **Cancel a detached run**: pass `cancel: true` on `watch_task` to stop a running detached task immediately (kills the child, releases the lock, and reports the run as cancelled).
+- **Read the feed, not the dump**: every `watch_task` report also carries a compact **digest** — `steps` (one entry per completed event: `kind` (`read`/`write`/`run`/`phase`), `label`, `target`, `dur_seconds`, `output`, token usage), plus `step_count`, `phase`, `elapsed_seconds` and `usage_latest`. That is what to render for a live status display; `content` remains the raw transcript tail for detail work.
 
 This handle-and-watch workflow is the way to watch a run live in a client that does not render MCP progress notifications.
 
