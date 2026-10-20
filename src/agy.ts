@@ -67,13 +67,54 @@ function boolEnv(name: string, fallback: boolean): boolean {
 
 export type TaskStatus = "success" | "error" | "timeout" | "quota_error";
 
+/**
+ * Reasoning effort levels the available agy models actually accept
+ * (`agy models` offers low/medium/high only; the CLI rejects anything else
+ * with "has no \"xhigh\" effort (available: low, medium, high)").
+ */
+export const EFFORT_LEVELS = ["low", "medium", "high"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+/**
+ * Tier suffixes a model id may already carry (e.g. `gemini-3.8-flash-high`).
+ * The detection list is wider than EFFORT_LEVELS on purpose: a hypothetical
+ * tiered id is still recognized as tier-carrying, while only low/medium/high
+ * are accepted effort values.
+ */
+export const MODEL_TIERS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type ModelTier = (typeof MODEL_TIERS)[number];
+
+/**
+ * Case-insensitive on purpose: the agy CLI resolves model ids
+ * case-insensitively (`--model GEMINI-3.8-FLASH-HIGH` is the same model as
+ * `gemini-3.8-flash-high`), so a differently-cased tier suffix is still a
+ * tier suffix.
+ */
+const MODEL_TIER_PATTERN = new RegExp(`-(${MODEL_TIERS.join("|")})$`, "i");
+
+/**
+ * The tier a model id already carries ("high" for "gemini-3.8-flash-high" and
+ * for "GEMINI-3.8-FLASH-HIGH"), if any. The tier is returned lowercased so it
+ * compares directly with the (lowercase-only) effort levels.
+ */
+export function modelTier(model?: string): ModelTier | undefined {
+  if (!model) return undefined;
+  const match = MODEL_TIER_PATTERN.exec(model.trim());
+  return match ? (match[1].toLowerCase() as ModelTier) : undefined;
+}
+
+/** Whether a value is one of the effort levels the CLI accepts. */
+export function isEffortLevel(value: unknown): value is EffortLevel {
+  return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+}
+
 export interface TaskOptions {
   prompt: string;
   cwd?: string;
   conversationId?: string;
   agent?: string;
   model?: string;
-  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  effort?: EffortLevel;
   /**
    * Fixed per tool (general_task: accept-edits, explore_task: plan) and not
    * caller-selectable: a read-only explore_task must stay read-only.

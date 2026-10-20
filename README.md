@@ -45,7 +45,9 @@ From a local checkout (`npm install` first): `opencode mcp add agy -- "$(pwd)/bi
 | `list_models` | List model IDs accepted by `model`. |
 | `list_agents` | List agent profiles accepted by `agent`. |
 
-Mode is pinned per tool (`accept-edits` for `general_task`, `plan` for `explore_task`), while `model`, `agent`, and `effort` (`low`, `medium`, `high`, `xhigh`, `max`) are optional per call.
+Mode is pinned per tool (`accept-edits` for `general_task`, `plan` for `explore_task`), while `model`, `agent`, and `effort` (`low`, `medium`, `high` — the levels the available models accept) are optional per call.
+
+Model IDs come in two shapes: a bare ID (`gemini-3.8-flash`) that takes its tier from `effort`, and a tier-carrying ID (`gemini-3.8-flash-high`, as returned by `list_models`) that already encodes it. A tier-carrying ID wins over `effort`: no `--effort` flag is passed for it, and combining it with a *different* effort is refused locally (the `agy` CLI rejects that combination outright).
 
 ## Watching a run live
 
@@ -89,7 +91,7 @@ npx agy-agent-follow --model gemini-3.8-flash --effort high "summarize the open 
 
 - Delegates through the same runner as the MCP tools; every mirrored transcript line is printed to stdout as it is written, with the machine-readable result JSON right before exit (exit code `0` only on `status: "success"`).
 - `--tool general|explore` switches the posture (`accept-edits` vs read-only `plan`), plus `--cwd` and `--timeout-ms`.
-- No `--effort` flag on purpose — the model ID carries its tier, and mixing `--model <tiered-id>` with a conflicting `--effort` is rejected by the `agy` CLI.
+- `--effort low|medium|high` sets the reasoning tier; a model ID that already carries one (e.g. `gemini-3.8-flash-high`) must not repeat a different tier — that combination is refused locally, before any task is spawned.
 - Ctrl-C / SIGTERM kill the in-flight `agy` child (single-flight per process; receipts in the same tasks directory).
 
 ## Delegating
@@ -97,6 +99,7 @@ npx agy-agent-follow --model gemini-3.8-flash --effort high "summarize the open 
 - **The call is the wait**: `general_task` and `explore_task` block until the headless `agy` process exits and return the structured report (`response`, `status`, `duration_seconds`, `usage`, `denied_actions`, `files_touched`, `stream_file`, `transcript_file`).
 - **Resumable conversations**: each result includes a `conversation_id` UUID when reported by the CLI; pass it back on a subsequent `general_task` or `explore_task` call to continue the thread.
 - **Per-call overrides**: pass optional `model`, `agent`, `effort`, `cwd`, `add_dirs`, `project`, `sandbox`, or `auto_approve` (`--dangerously-skip-permissions`, pair with `sandbox`) on any task call.
+- **Effort defaults**: without an explicit `effort`, `general_task` runs at `medium` and `explore_task` at `low`; a tier-carrying model ID (as returned by `list_models`) overrides that default, because its tier is already part of the ID.
 - **Edit scope auditing**: pass `edit_scope` (files or directories relative to `cwd`, or absolute) to declare the expected edit boundary; when `cwd` is a git repository, the server diffs `git status --porcelain` before and after the run to surface `files_touched` and any out-of-scope `scope_violations` in the result.
 - **Idle timeout vs. hard ceiling**: an idle timer kills a silent child after 15 minutes by default (`timeout_ms` per call or `AGY_MCP_IDLE_TIMEOUT_MS`, `0..3600000`, `0` disables) and resets on every stdout or stderr byte, so a productive run is never killed for being slow; set `AGY_MCP_PRINT_TIMEOUT_MS` for an opt-in hard wall-clock ceiling.
 - **Headless permissions**: headless runs never prompt and auto-deny gated tools (reported in `denied_actions`); permission allow-rules (such as `command(<prefix>)` under `permissions.allow`) live in your own Antigravity `settings.json`, which this server never edits.

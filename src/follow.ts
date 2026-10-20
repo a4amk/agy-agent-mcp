@@ -16,17 +16,19 @@
  * mismatch is refused locally before a task is ever spawned.
  */
 import path from "node:path";
-import { runTask, shutdownRunner, type TaskOptions, type TaskResult } from "./agy.ts";
+import {
+  EFFORT_LEVELS,
+  isEffortLevel,
+  modelTier,
+  runTask,
+  shutdownRunner,
+  type TaskOptions,
+  type TaskResult,
+} from "./agy.ts";
 
 /** Tool name -> fixed runner mode preset (the same pinning as the MCP tools). */
 const TOOL_MODES = { general: "accept-edits", explore: "plan" } as const;
 type ToolName = keyof typeof TOOL_MODES;
-
-/** Reasoning effort levels the agy CLI accepts for a model. */
-const EFFORT_LEVELS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
-
-/** A model id that already carries its tier, e.g. gemini-3.8-flash-high. */
-const MODEL_TIER = /-(low|medium|high|xhigh|max)$/;
 
 const FOLLOW_NAME = "agy-agent-follow";
 
@@ -42,9 +44,10 @@ Options:
                            (default), explore -> plan (read-only).
   --model <model-id>       Model for the task, e.g. gemini-3.8-flash. Pair it
                            with --effort to choose the reasoning tier.
-  --effort <level>         Reasoning effort: low|medium|high|xhigh|max. A
-                           model id that already carries a tier (e.g.
-                           gemini-3.8-flash-high) must not repeat it.
+  --effort <level>         Reasoning effort: low|medium|high (the levels the
+                           available models accept). A model id that already
+                           carries a tier (e.g. gemini-3.8-flash-high) must not
+                           repeat it.
   --cwd <dir>              Working directory for the delegated task
                            (default: this process's cwd).
   --timeout-ms <n>         Idle timeout for the run in ms, 0..3600000
@@ -108,7 +111,7 @@ function parseInvocation(argv: string[]): FollowInvocation {
         if (/^\d+$/.test(value) && Number(value) <= 3_600_000) parsed.timeoutMs = Number(value);
         else problems.push(`--timeout-ms must be an integer in 0..3600000, got: ${value}`);
       } else if (arg === "--effort") {
-        if (EFFORT_LEVELS.includes(value)) parsed.effort = value as TaskOptions["effort"];
+        if (isEffortLevel(value)) parsed.effort = value;
         else problems.push(`--effort must be one of ${EFFORT_LEVELS.join("|")}, got: ${value}`);
       } else if (arg === "--model") {
         parsed.model = value;
@@ -125,10 +128,10 @@ function parseInvocation(argv: string[]): FollowInvocation {
   // different --effort ("invalid model selection ... conflicts"). Catch it
   // locally so the mismatch is a usage error instead of a spawned-and-failed
   // run.
-  const modelTier = parsed.model?.match(MODEL_TIER)?.[1];
-  if (modelTier && parsed.effort && modelTier !== parsed.effort) {
+  const modelTierValue = modelTier(parsed.model);
+  if (modelTierValue && parsed.effort && modelTierValue.toLowerCase() !== parsed.effort.toLowerCase()) {
     problems.push(
-      `--model ${parsed.model} already carries tier "${modelTier}" which conflicts with --effort ${parsed.effort}; pass one or the other`
+      `--model ${parsed.model} already carries tier "${modelTierValue}" which conflicts with --effort ${parsed.effort}; pass one or the other`
     );
   }
   if (parsed.prompt === undefined && !parsed.help && problems.length === 0) {

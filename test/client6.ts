@@ -70,6 +70,20 @@
  *     (one entry per completed event with kind, label, target, duration and
  *     token usage), plus phase, elapsed_seconds and usage_latest - while the
  *     raw transcript tail stays available.
+ * 15. Effort & model resolution in the MCP layer (the argv the server really
+ *     spawns, driven over stdio against a fake agy):
+ *     - general_task without model/effort passes --effort medium, explore_task
+ *       passes --effort low (the documented defaults are real now);
+ *     - a tier-carrying model id (gemini-3.8-flash-high) suppresses --effort
+ *       entirely - both without an effort and with the matching one;
+ *     - a tier-carrying model id with a DIFFERENT effort, an unsupported
+ *       effort (xhigh) and an off-enum effort (banana) are refused locally:
+ *       isError envelope with a {"error": ...} body and ZERO fake-agy
+ *       invocations, and the single-flight lock is released afterwards.
+ *     - tier detection is case-insensitive (the agy CLI resolves model ids
+ *       case-insensitively): a case-variant tier id is refused locally on a
+ *       conflicting effort (zero invocations) and suppresses --effort
+ *       otherwise.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -2518,6 +2532,284 @@ const HANDSHAKE = (clientName: string) => ({
   }
   console.log(
     "watch digest: 6 structured steps (phase/write/read/run) with targets, durations and token usage, phase + elapsed + usage_latest, raw tail retained: ok"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 15. Effort & model resolution in the MCP layer (real argv over stdio)
+// ---------------------------------------------------------------------------
+{
+  // One fake invocation per delegation: an "invoke" marker line followed by
+  // the argv the server actually spawned.
+  const EFFORT_BODY = [
+    `printf '%s\\n' "invoke" >> "$AGY_FAKE_ARGFILE"`,
+    `printf '%s\\n' "$@" >> "$AGY_FAKE_ARGFILE"`,
+    `printf '%s\\n' '{"event":"init","conversation_id":"effort-c1","init":{"cwd":"/work/effort","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"effort-c1","status":"SUCCESS","response":"effort probe ok","duration_seconds":0.2,"num_turns":1}}'`,
+  ].join("\n");
+  const effortBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(effortBin, `#!/bin/sh\n${EFFORT_BODY}\n`);
+  chmodSync(effortBin, 0o755);
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "agy-effort-"));
+
+  /** The fake's argv log, split into one argv array per real invocation. */
+  const invocations = (): string[][] => {
+    const argfile = path.join(stateDir, "argv.txt");
+    if (!existsSync(argfile)) return [];
+    const out: string[][] = [];
+    let current: string[] | null = null;
+    for (const line of readFileSync(argfile, "utf8").split("\n").filter(Boolean)) {
+      if (line === "invoke") {
+        current = [];
+        out.push(current);
+        continue;
+      }
+      current?.push(line);
+    }
+    return out;
+  };
+
+  const flagValue = (argv: string[], flag: string): string | undefined => {
+    const i = argv.indexOf(flag);
+    return i < 0 ? undefined : argv[i + 1];
+  };
+
+  type EffortBody = { status?: string; error?: string; [k: string]: unknown };
+
+  let nextId = 200;
+  const { exitCode } = await driveMcpStdio(effortBin, stateDir, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 199, method: "initialize", params: HANDSHAKE("effort-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(199), "initialize response (id 199)");
+
+    /** One delegation call; returns the wire envelope plus its parsed body. */
+    const call = async (name: string, args: Record<string, unknown>) => {
+      nextId += 1;
+      const id = nextId;
+      io.send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+      await io.waitUntil(() => !!io.responseFor(id), `response (id ${id})`);
+      const resp = io.responseFor(id);
+      return {
+        id,
+        isError: resp?.result?.isError === true,
+        body: JSON.parse(contentText(resp, id)) as EffortBody,
+      };
+    };
+
+    // (a) general_task without model/effort: the documented default effort
+    //     (medium) must reach the CLI as --effort medium.
+    const a = await call("general_task", { prompt: "default effort probe", cwd: stateDir });
+    if (a.isError || a.body.status !== "success") {
+      throw new Error(`(15a) general_task without effort must succeed: ${JSON.stringify(a.body)}`);
+    }
+    const argvA = invocations()[0] ?? [];
+    if (flagValue(argvA, "--effort") !== "medium") {
+      throw new Error(`(15a) general_task must pass --effort medium, argv: ${argvA.join(" ")}`);
+    }
+    if (flagValue(argvA, "--mode") !== "accept-edits") {
+      throw new Error(`(15a) general_task must keep its mode preset, argv: ${argvA.join(" ")}`);
+    }
+
+    // (b) explore_task without model/effort: its preset is low.
+    const b = await call("explore_task", { prompt: "default effort probe", cwd: stateDir });
+    if (b.isError || b.body.status !== "success") {
+      throw new Error(`(15b) explore_task without effort must succeed: ${JSON.stringify(b.body)}`);
+    }
+    const argvB = invocations()[1] ?? [];
+    if (flagValue(argvB, "--effort") !== "low") {
+      throw new Error(`(15b) explore_task must pass --effort low, argv: ${argvB.join(" ")}`);
+    }
+    if (flagValue(argvB, "--mode") !== "plan") {
+      throw new Error(`(15b) explore_task must keep its mode preset, argv: ${argvB.join(" ")}`);
+    }
+
+    // (c) A tier-carrying model id wins over the default effort: no --effort
+    //     flag at all (the id already encodes the tier).
+    const c = await call("general_task", {
+      prompt: "tiered model probe",
+      cwd: stateDir,
+      model: "gemini-3.8-flash-high",
+    });
+    if (c.isError || c.body.status !== "success") {
+      throw new Error(`(15c) a tier-carrying model id must run fine: ${JSON.stringify(c.body)}`);
+    }
+    const argvC = invocations()[2] ?? [];
+    if (argvC.includes("--effort")) {
+      throw new Error(`(15c) a tier-carrying model id must not get --effort, argv: ${argvC.join(" ")}`);
+    }
+    if (flagValue(argvC, "--model") !== "gemini-3.8-flash-high") {
+      throw new Error(`(15c) the model id must reach agy verbatim, argv: ${argvC.join(" ")}`);
+    }
+
+    // (d) Same tier-carrying model + the MATCHING effort: still no --effort
+    //     (the id already says "high"), and the run succeeds.
+    const d = await call("general_task", {
+      prompt: "tiered model probe",
+      cwd: stateDir,
+      model: "gemini-3.8-flash-high",
+      effort: "high",
+    });
+    if (d.isError || d.body.status !== "success") {
+      throw new Error(`(15d) a matching effort on a tier-carrying id must succeed: ${JSON.stringify(d.body)}`);
+    }
+    const argvD = invocations()[3] ?? [];
+    if (argvD.includes("--effort")) {
+      throw new Error(`(15d) a matching effort must not add --effort, argv: ${argvD.join(" ")}`);
+    }
+
+    // (e) Tier-carrying model + a DIFFERENT effort: refused locally - the
+    //     error envelope, and NOTHING is spawned.
+    const beforeE = invocations().length;
+    const e = await call("general_task", {
+      prompt: "conflicting effort probe",
+      cwd: stateDir,
+      model: "gemini-3.8-flash-high",
+      effort: "low",
+    });
+    if (e.isError !== true) {
+      throw new Error(`(15e) a conflicting effort must be an isError result: ${JSON.stringify(e.body)}`);
+    }
+    if (Object.keys(e.body).join(",") !== "error") {
+      throw new Error(`(15e) the local error must use the {"error": ...} envelope: ${JSON.stringify(e.body)}`);
+    }
+    const eMsg = e.body.error ?? "";
+    if (
+      !eMsg.includes("gemini-3.8-flash-high") ||
+      !eMsg.includes("high") ||
+      !eMsg.includes("low") ||
+      !/conflict/i.test(eMsg)
+    ) {
+      throw new Error(`(15e) the conflict message must name the model, both tiers and the clash: ${eMsg}`);
+    }
+    if (invocations().length !== beforeE) {
+      throw new Error(`(15e) a conflicting effort must spawn nothing, argv log grew to ${invocations().length}`);
+    }
+
+    // (f) An effort level no model supports (xhigh): refused locally.
+    const beforeF = invocations().length;
+    const f = await call("general_task", { prompt: "xhigh probe", cwd: stateDir, effort: "xhigh" });
+    if (f.isError !== true) {
+      throw new Error(`(15f) effort "xhigh" must be an isError result: ${JSON.stringify(f.body)}`);
+    }
+    if (Object.keys(f.body).join(",") !== "error") {
+      throw new Error(`(15f) the local error must use the {"error": ...} envelope: ${JSON.stringify(f.body)}`);
+    }
+    if (!(f.body.error ?? "").includes("xhigh")) {
+      throw new Error(`(15f) the error must name the rejected effort: ${f.body.error ?? ""}`);
+    }
+    if (invocations().length !== beforeF) {
+      throw new Error(`(15f) effort "xhigh" must spawn nothing, argv log grew to ${invocations().length}`);
+    }
+
+    // (g) An effort outside the schema enum (banana): refused locally.
+    const beforeG = invocations().length;
+    const g = await call("general_task", { prompt: "banana probe", cwd: stateDir, effort: "banana" });
+    if (g.isError !== true) {
+      throw new Error(`(15g) effort "banana" must be an isError result: ${JSON.stringify(g.body)}`);
+    }
+    if (Object.keys(g.body).join(",") !== "error") {
+      throw new Error(`(15g) the local error must use the {"error": ...} envelope: ${JSON.stringify(g.body)}`);
+    }
+    if (!(g.body.error ?? "").includes("banana")) {
+      throw new Error(`(15g) the error must name the rejected effort: ${g.body.error ?? ""}`);
+    }
+    if (invocations().length !== beforeG) {
+      throw new Error(`(15g) effort "banana" must spawn nothing, argv log grew to ${invocations().length}`);
+    }
+
+    // (h) A bare model id takes the caller's effort (both flags reach agy).
+    const h = await call("general_task", {
+      prompt: "bare model probe",
+      cwd: stateDir,
+      model: "gemini-3.8-flash",
+      effort: "high",
+    });
+    if (h.isError || h.body.status !== "success") {
+      throw new Error(`(15h) a bare model id plus an effort must succeed: ${JSON.stringify(h.body)}`);
+    }
+    const argvH = invocations()[invocations().length - 1] ?? [];
+    if (flagValue(argvH, "--model") !== "gemini-3.8-flash" || flagValue(argvH, "--effort") !== "high") {
+      throw new Error(`(15h) a bare model id must keep both --model and --effort, argv: ${argvH.join(" ")}`);
+    }
+
+    // (i) The lock is released after a local validation failure: the very
+    //     next delegation is accepted and runs.
+    const i = await call("general_task", { prompt: "after rejection probe", cwd: stateDir });
+    if (i.isError || i.body.status !== "success") {
+      throw new Error(`(15i) a delegation after a validation failure must succeed: ${JSON.stringify(i.body)}`);
+    }
+    const argvI = invocations()[invocations().length - 1] ?? [];
+    if (flagValue(argvI, "--effort") !== "medium") {
+      throw new Error(`(15i) the default effort must still apply afterwards, argv: ${argvI.join(" ")}`);
+    }
+
+    // (j) The agy CLI resolves model ids CASE-INSENSITIVELY, so tier
+    //     detection must be too: a case-variant tier id + a conflicting
+    //     effort is refused locally (nothing spawned) ...
+    const caseVariants = ["GEMINI-3.8-FLASH-HIGH", "gemini-3.8-flash-HIGH", "Gemini-3.8-Flash-High"];
+    for (const model of caseVariants) {
+      const before = invocations().length;
+      const r = await call("general_task", {
+        prompt: "case-variant tier probe",
+        cwd: stateDir,
+        model,
+        effort: "medium",
+      });
+      if (r.isError !== true) {
+        throw new Error(`(15j) a case-variant tier id + a conflicting effort must be refused: ${model}`);
+      }
+      if (Object.keys(r.body).join(",") !== "error") {
+        throw new Error(`(15j) the local error must use the {"error": ...} envelope: ${JSON.stringify(r.body)}`);
+      }
+      const msg = r.body.error ?? "";
+      if (!msg.includes(model) || !msg.includes("high") || !/conflict/i.test(msg)) {
+        throw new Error(`(15j) the conflict message must name the model and its tier: ${msg}`);
+      }
+      if (invocations().length !== before) {
+        throw new Error(`(15j) a case-variant tier conflict must spawn nothing: ${model}`);
+      }
+    }
+
+    // ... and a case-variant tier id with the MATCHING effort is not a
+    //     conflict: the id wins and no --effort is passed for it.
+    const j = await call("general_task", {
+      prompt: "case-variant tier probe",
+      cwd: stateDir,
+      model: "gemini-3.8-flash-HIGH",
+      effort: "high",
+    });
+    if (j.isError || j.body.status !== "success") {
+      throw new Error(`(15j) a case-variant tier id + the matching effort must succeed: ${JSON.stringify(j.body)}`);
+    }
+    const argvJ = invocations()[invocations().length - 1] ?? [];
+    if (argvJ.includes("--effort")) {
+      throw new Error(`(15j) a case-variant tier id must not get --effort, argv: ${argvJ.join(" ")}`);
+    }
+
+    // (k) A case-variant tier id with NO effort: it carries its tier, so it
+    //     runs fine and still gets no --effort.
+    const k = await call("general_task", {
+      prompt: "case-variant tier probe",
+      cwd: stateDir,
+      model: "GEMINI-3.8-FLASH-HIGH",
+    });
+    if (k.isError || k.body.status !== "success") {
+      throw new Error(`(15k) a case-variant tier id without an effort must succeed: ${JSON.stringify(k.body)}`);
+    }
+    const argvK = invocations()[invocations().length - 1] ?? [];
+    if (argvK.includes("--effort")) {
+      throw new Error(`(15k) a case-variant tier id must not get --effort, argv: ${argvK.join(" ")}`);
+    }
+    if (flagValue(argvK, "--model") !== "GEMINI-3.8-FLASH-HIGH") {
+      throw new Error(`(15k) the model id must reach agy verbatim, argv: ${argvK.join(" ")}`);
+    }
+  });
+  if (exitCode !== 0) {
+    throw new Error(`effort/model suite must exit 0, got ${exitCode}`);
+  }
+
+  console.log(
+    "effort & model resolution: general_task --effort medium, explore_task --effort low, tier-carrying id suppresses --effort, conflicting/unsupported/off-enum efforts refused locally with 0 invocations, case-variant tier ids detected: ok"
   );
 }
 

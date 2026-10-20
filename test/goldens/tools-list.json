@@ -4,7 +4,7 @@
       {
         "name": "general_task",
         "title": "Run general-purpose Antigravity sub-agent task",
-        "description": "Delegate a general-purpose coding task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Defaults: mode accept-edits, effort medium. The result carries the agent's final response, the resumable conversation_id, token usage, denied_actions, and the git-based files_touched/scope_violations audit when cwd is a git repo. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. File edits inside the task cwd never prompt; set edit_scope so out-of-scope changes are flagged in the audit. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
+        "description": "Delegate a general-purpose coding task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Defaults: mode accept-edits, effort medium (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no --effort is passed for it). The result carries the agent's final response, the resumable conversation_id, token usage, denied_actions, and the git-based files_touched/scope_violations audit when cwd is a git repo. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. File edits inside the task cwd never prompt; set edit_scope so out-of-scope changes are flagged in the audit. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -23,7 +23,7 @@
             },
             "model": {
               "type": "string",
-              "description": "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field) or a tier-carrying id such as gemini-3.8-flash-high (see list_models). Never combine a tier-carrying id with a different effort - the agy CLI rejects that combination."
+              "description": "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field). Ids returned by list_models carry their tier (e.g. gemini-3.8-flash-high) and must not be combined with a different effort - the agy CLI rejects that combination. A tier-carrying id takes precedence over the default effort (its tier wins and no --effort is passed for it)."
             },
             "agent": {
               "type": "string",
@@ -34,11 +34,9 @@
               "enum": [
                 "low",
                 "medium",
-                "high",
-                "xhigh",
-                "max"
+                "high"
               ],
-              "description": "Reasoning effort for the task"
+              "description": "Reasoning effort for the task: low|medium|high (the only levels the available models accept). Applies to a model id that does not carry a tier - a tier-carrying id (e.g. gemini-3.8-flash-high, as returned by list_models) already encodes its tier and takes precedence over this effort."
             },
             "auto_approve": {
               "type": "boolean",
@@ -91,7 +89,7 @@
       {
         "name": "explore_task",
         "title": "Run read-only Antigravity exploration task",
-        "description": "Delegate a fast read-only exploration and diagnosis task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Defaults: mode plan (read-only), effort low; the mode preset is fixed, so callers cannot weaken the read-only posture. Produces answers and summaries without modifying files. Returns the same report as general_task, including the git-based files_touched/scope_violations audit. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
+        "description": "Delegate a fast read-only exploration and diagnosis task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Defaults: mode plan (read-only), effort low (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no --effort is passed for it); the mode preset is fixed, so callers cannot weaken the read-only posture. Produces answers and summaries without modifying files. Returns the same report as general_task, including the git-based files_touched/scope_violations audit. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -110,7 +108,7 @@
             },
             "model": {
               "type": "string",
-              "description": "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field) or a tier-carrying id such as gemini-3.8-flash-high (see list_models). Never combine a tier-carrying id with a different effort - the agy CLI rejects that combination."
+              "description": "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field). Ids returned by list_models carry their tier (e.g. gemini-3.8-flash-high) and must not be combined with a different effort - the agy CLI rejects that combination. A tier-carrying id takes precedence over the default effort (its tier wins and no --effort is passed for it)."
             },
             "agent": {
               "type": "string",
@@ -121,11 +119,9 @@
               "enum": [
                 "low",
                 "medium",
-                "high",
-                "xhigh",
-                "max"
+                "high"
               ],
-              "description": "Reasoning effort for the task"
+              "description": "Reasoning effort for the task: low|medium|high (the only levels the available models accept). Applies to a model id that does not carry a tier - a tier-carrying id (e.g. gemini-3.8-flash-high, as returned by list_models) already encodes its tier and takes precedence over this effort."
             },
             "auto_approve": {
               "type": "boolean",

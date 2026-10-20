@@ -21,6 +21,10 @@ import {
   ALLOW_AUTO_APPROVE,
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_PRINT_TIMEOUT_MS,
+  EFFORT_LEVELS,
+  type EffortLevel,
+  isEffortLevel,
+  modelTier,
   RETENTION_DAYS,
   ROOT,
   resolveStreamFile,
@@ -82,7 +86,7 @@ const DELEGATION_INPUT_SCHEMA: InputSchema = {
     model: {
       type: "string",
       description:
-        "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field) or a tier-carrying id such as gemini-3.8-flash-high (see list_models). Never combine a tier-carrying id with a different effort - the agy CLI rejects that combination.",
+        "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field). Ids returned by list_models carry their tier (e.g. gemini-3.8-flash-high) and must not be combined with a different effort - the agy CLI rejects that combination. A tier-carrying id takes precedence over the default effort (its tier wins and no --effort is passed for it).",
     },
     agent: {
       type: "string",
@@ -90,8 +94,9 @@ const DELEGATION_INPUT_SCHEMA: InputSchema = {
     },
     effort: {
       type: "string",
-      enum: ["low", "medium", "high", "xhigh", "max"],
-      description: "Reasoning effort for the task",
+      enum: ["low", "medium", "high"],
+      description:
+        "Reasoning effort for the task: low|medium|high (the only levels the available models accept). Applies to a model id that does not carry a tier - a tier-carrying id (e.g. gemini-3.8-flash-high, as returned by list_models) already encodes its tier and takes precedence over this effort.",
     },
     auto_approve: {
       type: "boolean",
@@ -190,11 +195,55 @@ function intArg(args: Args, key: string, min: number, max: number): number | und
   return typeof v === "number" && Number.isInteger(v) && v >= min && v <= max ? v : undefined;
 }
 
+/**
+ * Resolve the effort the runner must use (audit B1/B2/B3):
+ *
+ * - an explicit effort must be one of the levels the available models accept
+ *   (low|medium|high) - anything else is rejected locally;
+ * - a model id that already carries a tier conflicts with a *different*
+ *   effort (the agy CLI hard-fails on that combination), so it is rejected
+ *   locally too, before anything is spawned;
+ * - a tier-carrying id wins over the effort: the id already encodes the tier,
+ *   so no --effort flag is emitted next to it (this also covers the case where
+ *   the caller passed the very same tier);
+ * - without a tier-carrying model the caller's effort applies, else the tool's
+ *   preset (general_task: medium, explore_task: low).
+ *
+ * Tier detection and the tier/effort comparison are case-insensitive: the
+ * agy CLI resolves model ids case-insensitively, so "GEMINI-3.8-FLASH-HIGH"
+ * carries its tier just like "gemini-3.8-flash-high" does. The accepted
+ * effort values stay lowercase-only (the schema enum).
+ *
+ * Throws on a rejected call; the caller turns that into the standard
+ * {"error": ...} envelope without spawning a task.
+ */
+function resolveEffort(
+  model: string | undefined,
+  requested: string | undefined,
+  preset: TaskOptions["effort"]
+): EffortLevel | undefined {
+  const tier = modelTier(model);
+  if (requested !== undefined) {
+    if (!isEffortLevel(requested)) {
+      throw new Error(`effort must be one of ${EFFORT_LEVELS.join("|")}, got: ${requested}`);
+    }
+    if (tier && tier.toLowerCase() !== requested.toLowerCase()) {
+      throw new Error(
+        `model "${model}" already carries tier "${tier}" which conflicts with effort "${requested}"; pass one or the other`
+      );
+    }
+  }
+  // A tier-carrying model id carries its tier: never add --effort next to it.
+  if (tier) return undefined;
+  return requested ?? preset;
+}
+
 function toOptions(
   args: Args,
   sessionID?: string,
   presets?: { mode?: TaskOptions["mode"]; effort?: TaskOptions["effort"] }
 ): TaskOptions {
+  const model = stringArg(args, "model");
   return {
     // Runner-level validation reports honest error results for bad calls; the
     // schema literals above are advisory for clients only.
@@ -202,8 +251,10 @@ function toOptions(
     cwd: stringArg(args, "cwd"),
     conversationId: stringArg(args, "conversation_id"),
     agent: stringArg(args, "agent"),
-    model: stringArg(args, "model"),
-    effort: stringArg(args, "effort") as TaskOptions["effort"],
+    model,
+    // Local effort resolution: an unsupported level or a model/effort conflict
+    // throws here, so nothing is spawned for a call the CLI would reject.
+    effort: resolveEffort(model, stringArg(args, "effort"), presets?.effort),
     // No `mode` argument: each tool's preset is fixed by its registration so a
     // read-only explore_task cannot be weakened at call time.
     mode: presets?.mode,
@@ -405,7 +456,17 @@ async function runDelegation(
     // Visible in the server log: the client opted into progress for this call.
     process.stderr.write(`[${SERVER_NAME}] progress bridge active (token=${String(token)})\n`);
   }
-  const opts = toOptions(args, opencodeSessionID(params), presets);
+  let opts: TaskOptions;
+  try {
+    // Local validation (effort level, model/effort conflict) runs before
+    // anything is spawned: a rejected call must reach the client as the same
+    // {"error": ...} envelope the runner's own validation errors use, with
+    // isError set - not as a bare message.
+    opts = toOptions(args, opencodeSessionID(params), presets);
+  } catch (err) {
+    bridge?.finish();
+    return textResult({ error: (err as Error).message }, true);
+  }
   if (signal) opts.signal = signal;
 
   const background = boolArg(args, "background") ?? false;
@@ -512,7 +573,9 @@ const TOOLS: ToolSpec[] = [
     title: "Run general-purpose Antigravity sub-agent task",
     description:
       "Delegate a general-purpose coding task to the Antigravity (agy) CLI and block until the headless run " +
-      "exits (synchronous; the tool call IS the wait). Defaults: mode accept-edits, effort medium. The result " +
+      "exits (synchronous; the tool call IS the wait). Defaults: mode accept-edits, effort medium (a model id " +
+      "that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no " +
+      "--effort is passed for it). The result " +
       "carries the agent's final response, the resumable conversation_id, token usage, denied_actions, and the " +
       "git-based files_touched/scope_violations audit when cwd is a git repo. Headless runs auto-DENY tool " +
       "requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is " +
@@ -530,7 +593,9 @@ const TOOLS: ToolSpec[] = [
     description:
       "Delegate a fast read-only exploration and diagnosis task to the Antigravity (agy) CLI and block until " +
       "the headless run exits (synchronous; the tool call IS the wait). Defaults: mode plan (read-only), " +
-      "effort low; the mode preset is fixed, so callers cannot weaken the read-only posture. Produces answers " +
+      "effort low (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that " +
+      "default: its tier wins and no --effort is passed for it); the mode preset is fixed, so callers cannot " +
+      "weaken the read-only posture. Produces answers " +
       "and summaries without modifying files. Returns the same report as general_task, including the git-based " +
       "files_touched/scope_violations audit. Headless runs auto-DENY tool requests that would prompt instead of " +
       "hanging (surfaced in denied_actions); permission to allow them is granted by the user via " +
