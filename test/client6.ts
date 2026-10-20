@@ -1155,14 +1155,31 @@ console.log("protocol parity vs test/goldens (bin -> dist): starting");
   if (serverSrc.includes(' from "zod"')) {
     throw new Error('src/index.ts must not import from "zod"');
   }
-  // What a consumer install materializes: re-install the package manifest
-  // without devDependencies — nothing need appear under node_modules, least of
-  // all the withdrawn runtime deps.
+  // What a consumer install materializes: pack the package and install THAT
+  // tarball without devDependencies. This mirrors the registry artifact's own
+  // manifest (deps: none), so no npm version can materialize the withdrawn
+  // runtime deps from a devDependencies side-list of the repo manifest.
   const probe = mkdtempSync(path.join(os.tmpdir(), "agy-prod-install-"));
-  writeFileSync(path.join(probe, "package.json"), JSON.stringify(pkgFull, null, 2));
+  const packed = spawnSync("npm", ["pack", "--ignore-scripts", "--pack-destination", probe], {
+    cwd: ROOT,
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  const tgzName = packed.stdout.split("\n").filter(Boolean).pop();
+  if (!tgzName || !tgzName.endsWith(".tgz")) {
+    throw new Error(`npm pack probe failed (exit ${packed.status}): ${packed.stderr}`);
+  }
   const npm = spawnSync(
     "npm",
-    ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=error"],
+    [
+      "install",
+      "--omit=dev",
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund",
+      "--loglevel=error",
+      path.join(probe, tgzName),
+    ],
     { cwd: probe, encoding: "utf8", timeout: 120_000 }
   );
   if (npm.status !== 0) {
