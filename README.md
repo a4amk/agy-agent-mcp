@@ -70,6 +70,17 @@ Created /tmp/probe/hello.txt with the word probe.
 == done: status=SUCCESS · 12.1s
 ```
 
+### Live-follow companion CLI
+
+```sh
+npx agy-agent-follow --model gemini-3.8-flash-medium "summarize the open TODOs in src/ in one paragraph"
+```
+
+- Delegates through the same runner as the MCP tools; every mirrored transcript line is printed to stdout as it is written, with the machine-readable result JSON right before exit (exit code `0` only on `status: "success"`).
+- `--tool general|explore` switches the posture (`accept-edits` vs read-only `plan`), plus `--cwd` and `--timeout-ms`.
+- No `--effort` flag on purpose — the model ID carries its tier, and mixing `--model <tiered-id>` with a conflicting `--effort` is rejected by the `agy` CLI.
+- Ctrl-C / SIGTERM kill the in-flight `agy` child (single-flight per process; receipts in the same tasks directory).
+
 ## Delegating
 
 - **The call is the wait**: `general_task` and `explore_task` block until the headless `agy` process exits and return the structured report (`response`, `status`, `duration_seconds`, `usage`, `denied_actions`, `files_touched`, `stream_file`, `transcript_file`).
