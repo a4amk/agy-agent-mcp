@@ -77,6 +77,16 @@ export interface TaskOptions {
   timeoutMs?: number;
   /** OpenCode session ID (`ses_...`) attached by the client in request _meta. */
   sessionID?: string;
+  /**
+   * Progress-bridge hooks, wired server-side only (never supplied through tool
+   * arguments). onTaskStart fires exactly once right after the child spawns and
+   * the .stream file exists — before any mirrored line; onStreamLine fires
+   * synchronously after each mirrored append (fragments may be partial lines;
+   * consumers assemble lines themselves). Absent hooks keep runner behavior
+   * byte-identical.
+   */
+  onTaskStart?: (taskId: string, streamPath: string) => void;
+  onStreamLine?: (text: string) => void;
 }
 
 export interface Task {
@@ -295,12 +305,14 @@ function tryParseJsonObject(line: string): Record<string, unknown> | null {
   }
 }
 
-function appendStreamText(streamFile: string | undefined, text: string): void {
-  if (!streamFile || !text) return;
+/** Best-effort append to the `.stream` transcript; returns whether bytes were written. */
+function appendStreamText(streamFile: string | undefined, text: string): boolean {
+  if (!streamFile || !text) return false;
   try {
     appendFileSync(streamFile, text);
+    return true;
   } catch {
-    /* stream mirroring is best-effort */
+    return false; /* stream mirroring is best-effort */
   }
 }
 
@@ -470,13 +482,25 @@ export function renderToolStep(
  *   superseded candidates fall back into `noise`).
  * - Non-JSON lines go to `noise`.
  */
-function createStreamCollector(streamFile?: string) {
+function createStreamCollector(streamFile?: string, onStreamLine?: (text: string) => void) {
   let json: Record<string, unknown> | null = null;
   const noise: string[] = [];
   let pendingLegacy: { pos: number; line: string } | null = null;
   let openStepIndex: number | null = null;
   let openToolLabel: string | null = null;
   let midLine = false;
+
+  /**
+   * The single choke point for a running task's mirrored transcript appends:
+   * every human-readable line the runner renders flows through here, so the
+   * `.stream` file and the progress-bridge hook stay in lockstep. The hook
+   * fires synchronously in the same event-loop turn as (and only after) a
+   * successful file write.
+   */
+  const mirror = (text: string): void => {
+    if (!appendStreamText(streamFile, text)) return;
+    onStreamLine?.(text);
+  };
 
   const supersedeLegacy = () => {
     if (pendingLegacy !== null) {
@@ -498,7 +522,7 @@ function createStreamCollector(streamFile?: string) {
         const cwd = typeof init.cwd === "string" ? init.cwd : "";
         const perm = typeof init.permission_mode === "string" ? init.permission_mode : "";
         const tools = Array.isArray(init.tools) ? init.tools.length : 0;
-        appendStreamText(streamFile, `session open · cwd=${cwd} · permission_mode=${perm} · tools=${tools}\n`);
+        mirror(`session open · cwd=${cwd} · permission_mode=${perm} · tools=${tools}\n`);
       } else if (ev === "step_update") {
         const su =
           obj.step_update !== null && typeof obj.step_update === "object" && !Array.isArray(obj.step_update)
@@ -513,7 +537,7 @@ function createStreamCollector(streamFile?: string) {
         if (idx !== openStepIndex) {
           const prefix = midLine ? "\n" : "";
           const marker = toolRendered ? toolRendered.marker : `● ${stepType}`;
-          appendStreamText(streamFile, `${prefix}${marker}\n`);
+          mirror(`${prefix}${marker}\n`);
           openStepIndex = idx;
           openToolLabel = toolRendered ? toolRendered.label : null;
           midLine = false;
@@ -524,18 +548,18 @@ function createStreamCollector(streamFile?: string) {
           typeof su.text_delta === "string" &&
           su.text_delta.length > 0
         ) {
-          appendStreamText(streamFile, su.text_delta);
+          mirror(su.text_delta);
           midLine = !su.text_delta.endsWith("\n");
         }
         if (state === "DONE") {
           if (midLine) {
-            appendStreamText(streamFile, "\n");
+            mirror("\n");
             midLine = false;
           }
           openStepIndex = null;
           openToolLabel = null;
           if (toolRendered?.done) {
-            appendStreamText(streamFile, `${toolRendered.done}\n`);
+            mirror(`${toolRendered.done}\n`);
           } else if (stepType === "agent_response") {
             const dur = typeof su.duration_seconds === "number" ? su.duration_seconds : 0;
             const usage =
@@ -547,9 +571,9 @@ function createStreamCollector(streamFile?: string) {
                 typeof usage.thinking_tokens === "number" && usage.thinking_tokens > 0
                   ? ` · thinking ${usage.thinking_tokens}`
                   : "";
-              appendStreamText(streamFile, `  ⎿ done in ${dur}s · ${usage.total_tokens} tokens${thinking}\n`);
+              mirror(`  ⎿ done in ${dur}s · ${usage.total_tokens} tokens${thinking}\n`);
             } else {
-              appendStreamText(streamFile, `  ⎿ done in ${dur}s\n`);
+              mirror(`  ⎿ done in ${dur}s\n`);
             }
           }
         }
@@ -562,7 +586,7 @@ function createStreamCollector(streamFile?: string) {
         const prefix = midLine ? "\n" : "";
         const st = typeof inner.status === "string" ? inner.status : "UNKNOWN";
         const dur = typeof inner.duration_seconds === "number" ? inner.duration_seconds : 0;
-        appendStreamText(streamFile, `${prefix}== done: status=${st} · ${dur}s\n`);
+        mirror(`${prefix}== done: status=${st} · ${dur}s\n`);
         openStepIndex = null;
         openToolLabel = null;
         midLine = false;
@@ -680,6 +704,11 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
   }
   logEvent(task, { event: "spawn", code: 0, ms: Date.now() - t0, pid: child.pid });
 
+  // Progress bridge start: fired exactly once, before any mirrored line, right
+  // after the child spawned and the .stream file exists — the earliest point a
+  // caller can associate taskId with streamPath.
+  opts.onTaskStart?.(task.id, task.streamFile);
+
   // Primary termination is idle-based (resets on every stdout/stderr chunk);
   // DEFAULT_PRINT_TIMEOUT_MS > 0 opts into an additional hard wall ceiling.
   // Both send SIGTERM first and SIGKILL after a 5s grace period.
@@ -729,7 +758,7 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
 
   activeChildren.set(child, clearTimers);
 
-  const collector = createStreamCollector(task.streamFile);
+  const collector = createStreamCollector(task.streamFile, opts.onStreamLine);
   let stdoutBuf = "";
   let stderr = "";
   child.stdout?.on("data", (d) => {

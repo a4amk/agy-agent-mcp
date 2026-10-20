@@ -5,12 +5,17 @@
  * Transport is a hand-rolled, zero-dependency slice of the MCP stdio
  * protocol: newline-delimited JSON-RPC 2.0 over process.stdin/process.stdout
  * with exactly the request methods this package serves (initialize, ping,
- * tools/list, tools/call); every notification is swallowed and every other
- * method gets JSON-RPC "Method not found". Run: `npm run build` then
+ * tools/list, tools/call); every incoming notification is swallowed and every
+ * other method gets JSON-RPC "Method not found". The one notification the
+ * server emits itself is notifications/progress, mirroring a delegation's
+ * .stream transcript to clients that opted in with a _meta.progressToken;
+ * delegations are single-flight — a second general_task/explore_task while one
+ * runs is rejected, not queued. Run: `npm run build` then
  * `node dist/index.js` (bin/mcp.mjs wraps this; npm installs need compiled
  * JavaScript — Node won't type-strip under node_modules).
  */
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
   AGY_BIN,
   ALLOW_AUTO_APPROVE,
@@ -215,6 +220,180 @@ function textResult(value: unknown, isError = false): ToolResult {
 }
 
 // ---------------------------------------------------------------------------
+// Single-flight delegation lock + notifications/progress bridge
+// ---------------------------------------------------------------------------
+
+const DELEGATION_TOOLS = new Set(["general_task", "explore_task"]);
+
+/**
+ * At most one delegation may run at a time (the tool call IS the wait, so a
+ * blocked caller already serializes itself per session); a second
+ * general_task/explore_task arriving while one runs is rejected immediately —
+ * not queued — while watch_task, list_models, list_agents, and ping are never
+ * blocked. taskId/streamPath are filled by the runner's onTaskStart hook so a
+ * rejection can point at the live run before anything streams.
+ */
+let activeDelegation: { tool: string; taskId?: string; streamPath?: string } | null = null;
+
+/** House tool-error envelope naming the in-flight run (or the tool if it has not reported a task yet). */
+function delegationRejectedResult(): ToolResult {
+  const running = activeDelegation;
+  const detail =
+    running?.taskId && running.streamPath
+      ? `task ${running.taskId}, stream ${running.streamPath}`
+      : `tool ${running?.tool ?? "delegation"}`;
+  return {
+    content: [
+      {
+        type: "text",
+        text: `MCP error: another delegation is already running (${detail}); one agent at a time - retry after it completes`,
+      },
+    ],
+    isError: true,
+  };
+}
+
+/** notifications/progress emissions for a delegation are coalesced to this window. */
+const PROGRESS_COALESCE_MS = 200;
+/** Every mirrored line inside a progress message is clipped to this many chars. */
+const PROGRESS_LINE_CHARS = 160;
+/** The whole progress message is clipped to this many chars (plain truncation, so every fragment stays a substring of the mirrored line). */
+const PROGRESS_MESSAGE_CHARS = 400;
+/** Last N completed mirrored lines carried in a progress message. */
+const PROGRESS_TAIL_LINES = 2;
+
+function clipChars(s: string, max: number): string {
+  return s.length <= max ? s : s.slice(0, max);
+}
+
+/** Read optional `params._meta.progressToken` (string or number; presence means the client opted in). */
+function progressTokenArg(params: Args): string | number | undefined {
+  const meta = params._meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return undefined;
+  const token = (meta as Args).progressToken;
+  if (typeof token === "string") return token;
+  if (typeof token === "number" && Number.isFinite(token)) return token;
+  return undefined;
+}
+
+/**
+ * Progress bridge for one accepted delegation call that carried a
+ * _meta.progressToken. It accumulates the mirrored `.stream` lines fed by
+ * runTask's onStreamLine hook (each fired in the same event-loop turn as the
+ * file append) and emits notifications/progress at most every
+ * PROGRESS_COALESCE_MS with a monotonic completed-line counter. Without a
+ * token this factory is never called, so the observable wire behavior is
+ * byte-for-byte the pre-bridge one.
+ */
+function progressBridgeFor(token: string | number) {
+  const bridge = {
+    sent: 0, // last progress value emitted (0 = the task-started notification)
+    started: false,
+    finished: false,
+    count: 0, // completed mirrored lines so far (the strictly increasing counter)
+    buffer: "", // mirrored text whose line has not been terminated yet
+    tail: [] as string[], // last PROGRESS_TAIL_LINES completed mirrored lines
+    timer: null as ReturnType<typeof setTimeout> | null,
+  };
+
+  const sendProgress = (progress: number, message: string): void => {
+    writeLine({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: token, progress, message },
+    });
+    bridge.sent = progress;
+  };
+
+  const messageText = () =>
+    clipChars(bridge.tail.map((l) => clipChars(l, PROGRESS_LINE_CHARS)).join("\n"), PROGRESS_MESSAGE_CHARS);
+
+  const flush = (): void => {
+    bridge.timer = null;
+    if (bridge.count > bridge.sent) sendProgress(bridge.count, messageText());
+  };
+
+  return {
+    onTaskStart(_taskId: string, streamPath: string): void {
+      if (bridge.started) return;
+      bridge.started = true;
+      sendProgress(0, `task started · stream ${path.basename(streamPath)}`);
+    },
+    onStreamLine(text: string): void {
+      if (bridge.finished || !text) return;
+      bridge.buffer += text;
+      for (let nl = bridge.buffer.indexOf("\n"); nl >= 0; nl = bridge.buffer.indexOf("\n")) {
+        bridge.count++;
+        bridge.tail.push(bridge.buffer.slice(0, nl));
+        if (bridge.tail.length > PROGRESS_TAIL_LINES) bridge.tail.shift();
+        bridge.buffer = bridge.buffer.slice(nl + 1);
+      }
+      // Coalesce bursts: at most one notification per window, armed by the
+      // first line seen since the last flush. Unref'd so it never holds the
+      // process open.
+      if (bridge.timer === null) {
+        bridge.timer = setTimeout(flush, PROGRESS_COALESCE_MS);
+        bridge.timer.unref?.();
+      }
+    },
+    /**
+     * Synchronous final flush, called from the delegation task's finally
+     * before the result envelope for this call is written, so the last
+     * mirrored line (the == done: ... line) reaches the client ahead of the
+     * response. The coalesce timer was unref'd at creation; nothing is left
+     * armed when the flush clears it, so stdin EOF still exits cleanly.
+     */
+    finish(): void {
+      bridge.finished = true;
+      if (bridge.timer !== null) {
+        clearTimeout(bridge.timer);
+        bridge.timer = null;
+      }
+      if (bridge.count > bridge.sent) sendProgress(bridge.count, messageText());
+    },
+  };
+}
+
+/**
+ * Shared delegation path behind general_task / explore_task: builds the runner
+ * options, wires the progress bridge only when the request carried a
+ * _meta.progressToken, and flushes the bridge synchronously in finally. The
+ * single-flight lock was already engaged by the dispatcher before this runs.
+ */
+async function runDelegation(
+  args: Args,
+  params: Args,
+  presets: { mode?: TaskOptions["mode"]; effort?: TaskOptions["effort"] }
+): Promise<ToolResult> {
+  const token = progressTokenArg(params);
+  const bridge = token === undefined ? null : progressBridgeFor(token);
+  const opts = toOptions(args, opencodeSessionID(params), presets);
+  // Always wired, token or no token: the single-flight lock needs the
+  // in-flight taskId/streamPath the instant the run starts — before any line
+  // streams — so its rejection message can name them. With a token the bridge
+  // additionally mirrors the start notification.
+  opts.onTaskStart = (taskId, streamPath) => {
+    if (activeDelegation) {
+      activeDelegation.taskId = taskId;
+      activeDelegation.streamPath = streamPath;
+    }
+    bridge?.onTaskStart(taskId, streamPath);
+  };
+  if (bridge) {
+    opts.onStreamLine = (text) => bridge.onStreamLine(text);
+  }
+  try {
+    const result = await runTask(opts);
+    return textResult(result);
+  } catch (err) {
+    return textResult({ error: (err as Error).message }, true);
+  } finally {
+    // Final progress flush precedes the result envelope for this call.
+    bridge?.finish();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The five tools (same handler bodies as the SDK-era server)
 // ---------------------------------------------------------------------------
 
@@ -233,16 +412,7 @@ const TOOLS: ToolSpec[] = [
       "edit_scope so out-of-scope changes are flagged in the audit. auto_approve is the expert full-auto switch " +
       "(--dangerously-skip-permissions); pair it with sandbox when granting it.",
     inputSchema: DELEGATION_INPUT_SCHEMA,
-    handler: async (args, params) => {
-      try {
-        const result = await runTask(
-          toOptions(args, opencodeSessionID(params), { mode: "accept-edits", effort: "medium" })
-        );
-        return textResult(result);
-      } catch (err) {
-        return textResult({ error: (err as Error).message }, true);
-      }
-    },
+    handler: async (args, params) => runDelegation(args, params, { mode: "accept-edits", effort: "medium" }),
   },
   {
     name: "explore_task",
@@ -258,14 +428,7 @@ const TOOLS: ToolSpec[] = [
       "server never edits. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair " +
       "it with sandbox when granting it.",
     inputSchema: DELEGATION_INPUT_SCHEMA,
-    handler: async (args, params) => {
-      try {
-        const result = await runTask(toOptions(args, opencodeSessionID(params), { mode: "plan", effort: "low" }));
-        return textResult(result);
-      } catch (err) {
-        return textResult({ error: (err as Error).message }, true);
-      }
-    },
+    handler: async (args, params) => runDelegation(args, params, { mode: "plan", effort: "low" }),
   },
   {
     name: "watch_task",
@@ -368,17 +531,33 @@ function toolsCall(params: Args, id: JsonRpcId): void | Promise<void> {
       isError: true,
     });
   }
-  return tool.handler(asObject(params.arguments), params).then(
-    (result) => respond(id, result),
-    // Tool handlers catch their own runner errors; this arm is the defensive
-    // SDK-era transcript for a handler that itself threw: the error message
-    // verbatim in a text content block.
-    (err) =>
-      respond(id, {
-        content: [{ type: "text", text: err instanceof Error ? err.message : "Internal error" }],
-        isError: true,
-      })
-  );
+  // Single-flight delegation lock, engaged at dispatch entry: a second
+  // general_task/explore_task is rejected immediately (not queued), while
+  // watch_task / list_models / list_agents / ping never touch it.
+  const isDelegation = DELEGATION_TOOLS.has(name);
+  if (isDelegation) {
+    if (activeDelegation !== null) {
+      return respond(id, delegationRejectedResult());
+    }
+    activeDelegation = { tool: name };
+  }
+  return tool
+    .handler(asObject(params.arguments), params)
+    .then(
+      (result) => respond(id, result),
+      // Tool handlers catch their own runner errors; this arm is the defensive
+      // SDK-era transcript for a handler that itself threw: the error message
+      // verbatim in a text content block.
+      (err) =>
+        respond(id, {
+          content: [{ type: "text", text: err instanceof Error ? err.message : "Internal error" }],
+          isError: true,
+        })
+    )
+    .finally(() => {
+      // Released in finally so timeout kills and run errors release it too.
+      if (isDelegation) activeDelegation = null;
+    });
 }
 
 function dispatch(method: string, params: Args, id: JsonRpcId): void | Promise<void> {

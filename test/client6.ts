@@ -31,6 +31,18 @@
  *    field, src/index.ts imports neither the MCP SDK nor zod, and a
  *    production `npm install` of the package materializes neither
  *    `@modelcontextprotocol` nor `zod`.
+ * 9. Single-flight delegation lock over stdio (bin/mcp.mjs + slow fake agy):
+ *    while one general_task runs, a second general_task is rejected
+ *    immediately (never queued) with the isError envelope naming the in-flight
+ *    task id and stream basename, watch_task still answers mid-run, and
+ *    exactly ONE fake-agy invocation happened (argfile capture).
+ * 10. Progress bridge over stdio: with `_meta.progressToken` a delegation
+ *     call receives notifications/progress mirrors of its .stream transcript
+ *     in raw-stdout order (>=3 before the result, progress strictly increasing
+ *     from 0, every message fragment present in the final .stream file, the
+ *     == done line in the last message and written before the result
+ *     envelope); without a token the wire behavior stays exactly today's
+ *     (zero notifications/progress).
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -1192,6 +1204,399 @@ console.log("protocol parity vs test/goldens (bin -> dist): starting");
   }
   console.log(
     "zero runtime deps: no dependencies field, src/index.ts free of SDK/zod, production install brings no @modelcontextprotocol/zod: ok"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 9/10 shared driver: bin/mcp.mjs over one stdio connection + a slow fake agy
+// ---------------------------------------------------------------------------
+
+type ParsedJsonRpc = {
+  jsonrpc?: string;
+  id?: string | number;
+  method?: string;
+  params?: { progressToken?: string | number; progress?: number; message?: string; [k: string]: unknown };
+  result?: { content?: Array<{ type?: string; text?: string }>; isError?: boolean; [k: string]: unknown };
+  error?: { code?: number; message?: string };
+};
+
+interface McpIo {
+  /** Raw stdout lines in arrival order (one JSON-RPC frame per line). */
+  lines: string[];
+  parsed(): ParsedJsonRpc[];
+  send(message: unknown): void;
+  waitUntil(pred: () => boolean, label: string): Promise<void>;
+  responseFor(id: string | number): ParsedJsonRpc | undefined;
+}
+
+function parseLine(raw: string): ParsedJsonRpc {
+  try {
+    return JSON.parse(raw) as ParsedJsonRpc;
+  } catch {
+    return {};
+  }
+}
+
+function contentText(resp: ParsedJsonRpc | undefined, id: string | number): string {
+  const text = resp?.result?.content?.[0]?.text;
+  if (typeof text !== "string") {
+    throw new Error(`response ${id} must carry a text content block: ${JSON.stringify(resp)}`);
+  }
+  return text;
+}
+
+/**
+ * Spawn bin/mcp.mjs (dist build) with a fake agy, run `drive` against the
+ * collected stdout order, then end stdin and return the exit code (EOF must
+ * exit cleanly: the bridge timers are unref'd). Raw stdout lines stay in
+ * arrival order, one JSON-RPC frame per line.
+ */
+async function driveMcpStdio(
+  agyBin: string,
+  stateDir: string,
+  drive: (io: McpIo) => Promise<void>
+): Promise<{ exitCode: number; argfile: string }> {
+  const argfile = path.join(stateDir, "argv.txt");
+  const child = spawn(process.execPath, ["bin/mcp.mjs"], {
+    cwd: ROOT,
+    env: { ...process.env, AGY_BIN: agyBin, AGY_MCP_STATE_DIR: stateDir, AGY_FAKE_ARGFILE: argfile },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lines: string[] = [];
+  let pending = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (d: string) => {
+    pending += d;
+    for (;;) {
+      const nl = pending.indexOf("\n");
+      if (nl < 0) break;
+      lines.push(pending.slice(0, nl));
+      pending = pending.slice(nl + 1);
+    }
+  });
+
+  const io: McpIo = {
+    lines,
+    parsed: () => lines.map(parseLine),
+    send: (message) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    },
+    waitUntil: async (pred, label) => {
+      const deadline = Date.now() + 20_000;
+      while (!pred() && Date.now() < deadline) await sleep(20);
+      if (!pred()) {
+        child.kill("SIGKILL");
+        throw new Error(`timed out waiting for ${label}`);
+      }
+    },
+    responseFor: (id) => io.parsed().find((p) => p.id === id && ("result" in p || "error" in p)),
+  };
+
+  try {
+    await drive(io);
+  } catch (err) {
+    child.kill("SIGKILL");
+    throw err;
+  }
+  child.stdin.end();
+  const exitCode = await new Promise<number>((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve(-999);
+    }, 10_000);
+    child.on("exit", (c) => {
+      clearTimeout(timer);
+      resolve(c ?? -999);
+    });
+  });
+  return { exitCode, argfile };
+}
+
+/**
+ * Slow stream-json fixture shared by sections 9 and 10: records one "invoke"
+ * marker per real invocation (argv appended), then walks init -> user_input ->
+ * agent_response delta -> read_file step -> result event with 500ms pauses
+ * (well above the 200ms progress coalesce window, ~2s total). The result event
+ * renders the runner's `== done: status=... ` closing marker.
+ */
+const SLOW_STREAM_BODY = [
+  `printf '%s\\n' "invoke" >> "$AGY_FAKE_ARGFILE"`,
+  `printf '%s\\n' "$@" >> "$AGY_FAKE_ARGFILE"`,
+  `sleep 0.05`,
+  `printf '%s\\n' '{"event":"init","conversation_id":"slow-c1","init":{"cwd":"/work/slow","tools":["read_file"],"permission_mode":"plan"}}'`,
+  `sleep 0.5`,
+  `printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"slow-c1","step_index":0,"state":"DONE","step_type":"user_input"}}'`,
+  `sleep 0.5`,
+  `printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"slow-c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"working on it "}}'`,
+  `printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"slow-c1","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"hard","duration_seconds":0.5,"usage":{"total_tokens":1002}}}'`,
+  `sleep 0.5`,
+  `printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"slow-c1","step_index":2,"state":"DONE","step_type":"tool","tool_name":"read_file","duration_seconds":0.2,"tool_info":{"name":"read_file","parameters":{"Path":"/tmp/slow.txt"},"output":"1 lines, 6 bytes"}}}'`,
+  `sleep 0.5`,
+  `printf '%s\\n' '{"event":"result","result":{"conversation_id":"slow-c1","status":"SUCCESS","response":"working on it hard\\n","duration_seconds":2.1,"num_turns":1}}'`,
+].join("\n");
+
+function writeSlowAgy(): string {
+  const bin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(bin, `#!/bin/sh\n${SLOW_STREAM_BODY}\n`);
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+const HANDSHAKE = (clientName: string) => ({
+  protocolVersion: "2025-06-18",
+  capabilities: {},
+  clientInfo: { name: clientName, version: "0" },
+});
+
+// ---------------------------------------------------------------------------
+// 9. Single-flight lock: a second delegation is rejected, never queued
+// ---------------------------------------------------------------------------
+{
+  const slowLock = writeSlowAgy();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "agy-lock-"));
+  let rejectionMsg = "";
+  const { exitCode, argfile } = await driveMcpStdio(slowLock, stateDir, async (io) => {
+    io.send({
+      jsonrpc: "2.0",
+      id: 90,
+      method: "initialize",
+      params: HANDSHAKE("lock-probe"),
+    });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(90), "initialize response (id 90)");
+
+    // Back-to-back fire WITHOUT awaiting the first: same scenario ids 31/32.
+    const deleg = { name: "general_task", arguments: { prompt: "single-flight lock probe", cwd: stateDir } };
+    io.send({ jsonrpc: "2.0", id: 31, method: "tools/call", params: { ...deleg } });
+    io.send({
+      jsonrpc: "2.0",
+      id: 32,
+      method: "tools/call",
+      // Progress token on the REJECTED call, to prove it emits no progress.
+      params: { ...deleg, _meta: { progressToken: "tok-rejected" } },
+    });
+    await io.waitUntil(() => !!io.responseFor(32), "lock rejection response (id 32)");
+
+    // watch_task must NOT be locked while the first task still runs: found and
+    // running info (the fake needs ~2s to reach its == done marker).
+    io.send({ jsonrpc: "2.0", id: 33, method: "tools/call", params: { name: "watch_task", arguments: {} } });
+    await io.waitUntil(() => !!io.responseFor(33), "watch mid-run response (id 33)");
+    const watch = JSON.parse(contentText(io.responseFor(33), 33)) as {
+      found?: boolean;
+      running?: boolean;
+      finished?: boolean;
+    };
+    if (watch.found !== true || watch.running !== true || watch.finished !== false) {
+      throw new Error(`watch_task must answer found/running info mid-run, got: ${JSON.stringify(watch)}`);
+    }
+
+    await io.waitUntil(() => !!io.responseFor(31), "delegation response (id 31)");
+
+    const delegation = JSON.parse(contentText(io.responseFor(31), 31)) as {
+      status?: string;
+      task_id?: string;
+      stream_file?: string;
+    };
+    if (delegation.status !== "success" || typeof delegation.task_id !== "string") {
+      throw new Error(`run under the lock must succeed normally: ${JSON.stringify(delegation)}`);
+    }
+    if (typeof delegation.stream_file !== "string" || !delegation.stream_file.endsWith(".stream")) {
+      throw new Error(`delegation result must carry stream_file: ${JSON.stringify(delegation)}`);
+    }
+
+    const busy = io.responseFor(32);
+    if (busy?.result?.isError !== true) {
+      throw new Error(`response 32 must be the isError rejection envelope: ${JSON.stringify(busy)}`);
+    }
+    const msg = contentText(busy, 32);
+    rejectionMsg = msg;
+    const streamBase = path.basename(delegation.stream_file);
+    if (
+      !msg.includes("another delegation is already running") ||
+      !msg.includes("one agent at a time") ||
+      !msg.includes(delegation.task_id) ||
+      !msg.includes(streamBase)
+    ) {
+      throw new Error(
+        `rejection message must name the in-flight task id + stream basename and the one-agent rule:` +
+          ` task=${delegation.task_id} base=${streamBase} msg=${msg}`
+      );
+    }
+
+    // 31 carries no token and 32 was rejected: zero progress on this connection.
+    const notes = io.parsed().filter((p) => p.method === "notifications/progress");
+    if (notes.length !== 0) {
+      throw new Error(`rejected call under the lock must emit no notifications/progress: ${JSON.stringify(notes)}`);
+    }
+  });
+  if (exitCode !== 0) {
+    throw new Error(`stdin EOF must end the server cleanly with exit 0, got ${exitCode}`);
+  }
+
+  // Exactly ONE real agy invocation happened (argfile marker lines).
+  const invocations = readFileSync(argfile, "utf8")
+    .split("\n")
+    .filter((l) => l === "invoke").length;
+  if (invocations !== 1) {
+    throw new Error(`under the single-flight lock only one agy invocation may happen, argfile has ${invocations}`);
+  }
+  // The rejected call never started a run: only one task transcript exists.
+  const streamCount = readdirSync(stateDir).filter((f) => f.endsWith(".stream")).length;
+  if (streamCount !== 1) {
+    throw new Error(`rejected call must not create a second task, state dir has ${streamCount} .stream files`);
+  }
+
+  console.log(
+    `single-flight lock: id 32 isError rejection ("${rejectionMsg}") names task + stream, watch_task id 33 found/running mid-run, 1 invocation, EOF exit 0: ok`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Progress bridge: token-gated notifications/progress over stdio
+// ---------------------------------------------------------------------------
+{
+  const slowBridge = writeSlowAgy();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "agy-progress-"));
+  let noteCount = 0;
+  const { exitCode } = await driveMcpStdio(slowBridge, stateDir, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 91, method: "initialize", params: HANDSHAKE("progress-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(91), "initialize response (id 91)");
+
+    io.send({
+      jsonrpc: "2.0",
+      id: 41,
+      method: "tools/call",
+      params: {
+        name: "general_task",
+        arguments: { prompt: "progress bridge probe", cwd: stateDir },
+        _meta: { progressToken: "tok42" },
+      },
+    });
+    await io.waitUntil(() => !!io.responseFor(41), "delegation response (id 41)");
+
+    // Parse the raw stdout in ORDER: notifications before the result line.
+    const out = io.lines;
+    const resultIdx = out.findIndex((l) => {
+      const p = parseLine(l);
+      return p.id === 41 && ("result" in p || "error" in p);
+    });
+    if (resultIdx < 0) {
+      throw new Error(`must receive a result response for id 41: ${JSON.stringify(out.slice(-3))}`);
+    }
+
+    const notes: Array<{ progressToken: string | number; progress: number; message: string }> = [];
+    for (let i = 0; i < resultIdx; i++) {
+      const p = parseLine(out[i]);
+      if (p.method !== "notifications/progress") continue;
+      const params = p.params ?? {};
+      if (JSON.stringify(Object.keys(params).sort()) !== JSON.stringify(["message", "progress", "progressToken"])) {
+        throw new Error(`progress frame params shape wrong: ${JSON.stringify(params)}`);
+      }
+      notes.push(params as { progressToken: string; progress: number; message: string });
+    }
+    noteCount = notes.length;
+
+    // (b) progress values: strictly increasing integers starting at 0.
+    if (notes.length < 3) {
+      throw new Error(`(a) expected >=3 notifications/progress before the result, got ${notes.length}`);
+    }
+    if (notes[0].progress !== 0) {
+      throw new Error(`(b) first notification must be task-started progress=0: ${JSON.stringify(notes[0])}`);
+    }
+    const values = notes.map((n) => n.progress);
+    for (let i = 1; i < values.length; i++) {
+      if (!Number.isInteger(values[i]) || values[i] <= values[i - 1]) {
+        throw new Error(`(b) progress values must be strictly increasing integers: ${JSON.stringify(values)}`);
+      }
+    }
+    for (const n of notes) {
+      if (n.progressToken !== "tok42") {
+        throw new Error(`(b) progress token must be echoed as received: ${JSON.stringify(n)}`);
+      }
+    }
+
+    // The transcript exists and closes with the runner's == done marker.
+    const streamName = readdirSync(stateDir).find((f) => f.endsWith(".stream"));
+    if (typeof streamName !== "string") {
+      throw new Error(`state dir fixture must contain the task's .stream transcript: ${readdirSync(stateDir)}`);
+    }
+    const streamText = readFileSync(path.join(stateDir, streamName), "utf8");
+    if (!streamText.split("\n").some((l) => l.startsWith("== done: status="))) {
+      throw new Error(`stream transcript must end with a == done: marker:\n${streamText}`);
+    }
+
+    // The task-started notice is synthetic: stream basename only.
+    if (notes[0].message !== `task started · stream ${streamName}`) {
+      throw new Error(`task-started message must name the stream basename only: ${JSON.stringify(notes[0].message)}`);
+    }
+
+    // (c) every mirrored-line message fragment appears in the final .stream file.
+    for (const n of notes.slice(1)) {
+      for (const frag of n.message.split("\n")) {
+        if (frag !== "" && !streamText.includes(frag)) {
+          throw new Error(
+            `(c) progress fragment not present in the .stream transcript (${streamName}): ${JSON.stringify(frag)}`
+          );
+        }
+      }
+    }
+
+    // (d) the LAST progress message includes the == done line and its stdout
+    // position precedes the result response line for the same id.
+    const lastMsg = notes[notes.length - 1].message;
+    if (!lastMsg.includes("== done: status=SUCCESS")) {
+      throw new Error(`(d) last progress message must include the == done line: ${JSON.stringify(lastMsg)}`);
+    }
+    let lastNoteIdx = -1;
+    for (let i = resultIdx - 1; i >= 0; i--) {
+      if (parseLine(out[i]).method === "notifications/progress") {
+        lastNoteIdx = i;
+        break;
+      }
+    }
+    if (lastNoteIdx < 0 || lastNoteIdx >= resultIdx) {
+      throw new Error(`(d) final flush must precede the result envelope (note@${lastNoteIdx}, result@${resultIdx})`);
+    }
+
+    const delegation = JSON.parse(contentText(io.responseFor(41), 41)) as { status?: string };
+    if (delegation.status !== "success") {
+      throw new Error(`token-gated delegation must still succeed normally: ${JSON.stringify(delegation)}`);
+    }
+  });
+  if (exitCode !== 0) {
+    throw new Error(`stdin EOF must end the server cleanly with exit 0, got ${exitCode}`);
+  }
+
+  // (e) Repeat the same delegation WITHOUT the token on a fresh child: the
+  // observable behavior is exactly today's — zero notifications/progress.
+  const slowNoToken = writeSlowAgy();
+  const noTokenDir = mkdtempSync(path.join(os.tmpdir(), "agy-notoken-"));
+  const { exitCode: exitNoToken } = await driveMcpStdio(slowNoToken, noTokenDir, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 92, method: "initialize", params: HANDSHAKE("no-token-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(92), "initialize response (id 92)");
+    io.send({
+      jsonrpc: "2.0",
+      id: 42,
+      method: "tools/call",
+      params: { name: "general_task", arguments: { prompt: "tokenless delegation", cwd: noTokenDir } },
+    });
+    await io.waitUntil(() => !!io.responseFor(42), "tokenless delegation response (id 42)");
+    if (io.lines.some((l) => l.includes("notifications/progress"))) {
+      throw new Error(`(e) tokenless delegation must emit ZERO notifications/progress: ${JSON.stringify(io.lines)}`);
+    }
+    const delegation = JSON.parse(contentText(io.responseFor(42), 42)) as { status?: string };
+    if (delegation.status !== "success") {
+      throw new Error(`(e) tokenless delegation must succeed normally: ${JSON.stringify(delegation)}`);
+    }
+  });
+  if (exitNoToken !== 0) {
+    throw new Error(`(e) stdin EOF must end the server cleanly with exit 0, got ${exitNoToken}`);
+  }
+
+  console.log(
+    `progress bridge: ${noteCount} token-gated notifications (>=3 pre-result, progress strictly increasing from 0, fragments mirrored from .stream, == done last & ahead of the envelope); tokenless delegation emits 0: ok`
   );
 }
 
