@@ -1,26 +1,32 @@
-name: Publish to npm
+# Publishes the package to npm via Trusted Publishing (OIDC): no tokens, no
+# secrets. The trusted publisher configured on npmjs.com must name this exact
+# file (publish.yml), allow "npm publish", and complete its first publish
+# within 2 days of being created.
+name: publish
 
-# Tests are NOT run here (they need an authenticated `agy` session); run them locally before tagging.
-# Maintainer setup (one time): add an npm Automation token as the NPM_TOKEN repo secret.
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
+  id-token: write # Required for OIDC
   contents: read
-  id-token: write # npm provenance
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
         with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false # never use caching in release builds
       - run: npm ci
-      - run: npm publish --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm run build --if-present
+      - run: npm test
+      - run: npm publish
