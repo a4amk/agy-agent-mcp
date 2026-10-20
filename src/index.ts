@@ -8,7 +8,9 @@
  * tools/list, tools/call); every incoming notification is swallowed and every
  * other method gets JSON-RPC "Method not found". The one notification the
  * server emits itself is notifications/progress, mirroring a delegation's
- * .stream transcript to clients that opted in with a _meta.progressToken;
+ * .stream transcript to clients that opted in with a _meta.progressToken -
+ * only while that request is still in flight, so a detached (background: true)
+ * run emits none and is followed through watch_task instead;
  * delegations are single-flight — a second general_task/explore_task while one
  * runs is rejected, not queued. Run: `npm run build` then
  * `node dist/index.js` (bin/mcp.mjs wraps this; npm installs need compiled
@@ -156,7 +158,7 @@ const DELEGATION_INPUT_SCHEMA: Schema = {
     background: {
       type: "boolean",
       description:
-        "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. Default: false.",
+        "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. A detached run emits NO notifications/progress: MCP progress notifications only apply while the request is in flight, and a detached call has already been answered - watch_task is its progress channel. Default: false.",
     },
   },
   required: ["prompt"],
@@ -584,8 +586,9 @@ function progressBridgeFor(token: string | number) {
 /**
  * Shared delegation path behind general_task / explore_task: builds the runner
  * options, wires the progress bridge only when the request carried a
- * _meta.progressToken, and flushes the bridge synchronously in finally. The
- * single-flight lock was already engaged by the dispatcher before this runs.
+ * _meta.progressToken AND the call stays in flight, and flushes the bridge
+ * synchronously in finally. The single-flight lock was already engaged by the
+ * dispatcher before this runs.
  */
 async function runDelegation(
   args: Args,
@@ -593,8 +596,8 @@ async function runDelegation(
   presets: { mode?: TaskOptions["mode"]; effort?: TaskOptions["effort"] },
   signal?: AbortSignal
 ): Promise<ToolResult> {
-  const token = progressTokenArg(params);
   let opts: TaskOptions;
+  let background: boolean;
   try {
     // The advertised input schema is enforced BEFORE anything is spawned: a
     // call that does not match it is refused with the same {"error": ...}
@@ -603,11 +606,26 @@ async function runDelegation(
     const invalid = validateArgs(DELEGATION_INPUT_SCHEMA, args);
     if (invalid) throw new Error(invalid);
     opts = toOptions(args, opencodeSessionID(params), presets);
+    // Read BEFORE the bridge is created: whether the call stays in flight
+    // decides whether notifications/progress has anything to attach to.
+    background = boolArg(args, "background") ?? false;
   } catch (err) {
     return textResult({ error: (err as Error).message }, true);
   }
   // The progress bridge is wired only for an accepted call: a refused one
   // must not emit a single progress notification.
+  //
+  // A DETACHED call (background: true) answers immediately with a handle, so
+  // the request it belonged to is no longer in flight: notifications/progress
+  // would have nothing to attach to. The official MCP SDK client drops its
+  // progress handler when the response arrives and then reports "Received a
+  // progress notification for an unknown token" for every later frame. A
+  // detached run therefore creates NO bridge at all - no frames, no
+  // "progress bridge active" log line, no progress_bridge receipt field, and
+  // nothing at all from the detached run's finally. A _meta.progressToken on
+  // such a call is simply ignored (not an error, not echoed). watch_task is
+  // the detached run's progress channel.
+  const token = background ? undefined : progressTokenArg(params);
   const bridge = token === undefined ? null : progressBridgeFor(token);
   if (bridge) {
     // Visible in the server log: the client opted into progress for this call.
@@ -615,7 +633,6 @@ async function runDelegation(
   }
   if (signal) opts.signal = signal;
 
-  const background = boolArg(args, "background") ?? false;
   // A holder rather than a plain variable: the receipt is filled by the
   // onTaskStart callback (which fires synchronously inside runTask, before its
   // first await), and TypeScript's control-flow analysis cannot see an
@@ -724,7 +741,11 @@ const TOOLS: ToolSpec[] = [
     title: "Run general-purpose Antigravity sub-agent task",
     description:
       "Delegate a general-purpose coding task to the Antigravity (agy) CLI and block until the headless run " +
-      "exits (synchronous; the tool call IS the wait). Defaults: mode accept-edits, effort medium (a model id " +
+      "exits (synchronous; the tool call IS the wait). Pass background: true to detach instead: the call " +
+      "returns a task handle immediately and the run keeps going - a detached run emits NO " +
+      "notifications/progress (an MCP progress notification only belongs to a request that is still in " +
+      "flight), so watch_task is the detached run's progress channel. Defaults: mode accept-edits, effort " +
+      "medium (a model id " +
       "that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no " +
       "--effort is passed for it). The result " +
       "carries the agent's final response, the resumable conversation_id, token usage, denied_actions, and the " +
@@ -743,7 +764,10 @@ const TOOLS: ToolSpec[] = [
     title: "Run read-only Antigravity exploration task",
     description:
       "Delegate a fast read-only exploration and diagnosis task to the Antigravity (agy) CLI and block until " +
-      "the headless run exits (synchronous; the tool call IS the wait). Defaults: mode plan (read-only), " +
+      "the headless run exits (synchronous; the tool call IS the wait). Pass background: true to detach " +
+      "instead: the call returns a task handle immediately and the run keeps going - a detached run emits NO " +
+      "notifications/progress (an MCP progress notification only belongs to a request that is still in " +
+      "flight), so watch_task is the detached run's progress channel. Defaults: mode plan (read-only), " +
       "effort low (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that " +
       "default: its tier wins and no --effort is passed for it); the mode preset is fixed, so callers cannot " +
       "weaken the read-only posture. Produces answers " +
@@ -761,7 +785,9 @@ const TOOLS: ToolSpec[] = [
     title: "Watch live or recent task stream transcript",
     description:
       "Tails a task's live stream transcript. No args = latest run. Call it while a general_task/explore_task " +
-      "is in flight (this or any session) to watch the sub-agent work; the returned 'running' field plus " +
+      "is in flight (this or any session) to watch the sub-agent work; it is also the progress channel for a " +
+      "detached (background: true) run, which never emits notifications/progress. The returned 'running' field " +
+      "plus " +
       "'modified' tell a live run from an abandoned one. For a live feed prefer the compact digest: 'steps' " +
       "(one entry per read/write/run/phase with its target, duration and token cost), 'step_count', 'phase', " +
       "'elapsed_seconds' and 'usage_latest'. 'content' is the raw transcript tail - read it for detail, not " +

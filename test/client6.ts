@@ -43,7 +43,10 @@
  *     from 0, every message fragment present in the final .stream file, the
  *     == done line in the last message and written before the result
  *     envelope); without a token the wire behavior stays exactly today's
- *     (zero notifications/progress).
+ *     (zero notifications/progress); a DETACHED delegation (background: true)
+ *     emits NO progress at all - no frames before or after its response, no
+ *     progress_bridge in the run's receipt - while a foreground delegation on
+ *     the same connection still gets its bridge.
  * 11. Live-follow companion CLI (`dist/follow.js` over the fake-agy harness):
  *     the success run exits 0 with >=2 mirrored fake stream lines before the
  *     `=== task done ===` marker, the JSON after the marker parses to a
@@ -1665,8 +1668,129 @@ const HANDSHAKE = (clientName: string) => ({
     throw new Error(`(e) stdin EOF must end the server cleanly with exit 0, got ${exitNoToken}`);
   }
 
+  // (f) A DETACHED delegation (background: true) must emit NO
+  // notifications/progress at all: it answers immediately, so the request the
+  // progress frames would belong to is no longer in flight (the official MCP
+  // SDK client drops its progress handler on the response and then reports
+  // "unknown token" for every later frame). A FOREGROUND delegation on the
+  // same connection still gets its bridge, and the detached run's receipt
+  // carries no progress_bridge.
+  const detachedAgy = writeSlowAgy();
+  const detachedDir = mkdtempSync(path.join(os.tmpdir(), "agy-detached-progress-"));
+  let foregroundFrames = 0;
+  let detachedFrames = 0;
+  const { exitCode: exitDetached } = await driveMcpStdio(detachedAgy, detachedDir, async (io) => {
+    const progressFrames = () => io.parsed().filter((p) => p.method === "notifications/progress");
+
+    io.send({ jsonrpc: "2.0", id: 93, method: "initialize", params: HANDSHAKE("detached-progress-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(93), "initialize response (id 93)");
+
+    // (f1) The foreground path is untouched: a token still buys a bridge.
+    io.send({
+      jsonrpc: "2.0",
+      id: 43,
+      method: "tools/call",
+      params: {
+        name: "general_task",
+        arguments: { prompt: "foreground progress probe", cwd: detachedDir },
+        _meta: { progressToken: "tok-fg-detached" },
+      },
+    });
+    await io.waitUntil(() => !!io.responseFor(43), "foreground delegation response (id 43)");
+    foregroundFrames = progressFrames().length;
+    if (foregroundFrames < 1) {
+      throw new Error(`(f1) a foreground delegation must still emit notifications/progress, got ${foregroundFrames}`);
+    }
+    for (const frame of progressFrames()) {
+      if (frame.params?.progressToken !== "tok-fg-detached") {
+        throw new Error(`(f1) the foreground bridge must echo its own token: ${JSON.stringify(frame.params)}`);
+      }
+    }
+    const foregroundResult = JSON.parse(contentText(io.responseFor(43), 43)) as {
+      status?: string;
+      progress_bridge?: { token?: string | number; notifications?: number };
+    };
+    if (foregroundResult.status !== "success") {
+      throw new Error(`(f1) the foreground delegation must still succeed: ${JSON.stringify(foregroundResult)}`);
+    }
+    if (
+      foregroundResult.progress_bridge?.token !== "tok-fg-detached" ||
+      (foregroundResult.progress_bridge?.notifications ?? 0) < 1
+    ) {
+      throw new Error(
+        `(f1) the foreground receipt must carry its progress_bridge: ${JSON.stringify(foregroundResult)}`
+      );
+    }
+
+    // (f2) The detached path has no bridge: the token is ignored, not echoed.
+    const beforeDetached = progressFrames().length;
+    io.send({
+      jsonrpc: "2.0",
+      id: 44,
+      method: "tools/call",
+      params: {
+        name: "general_task",
+        arguments: { prompt: "detached progress probe", cwd: detachedDir, background: true },
+        _meta: { progressToken: "tok-bg-detached" },
+      },
+    });
+    await io.waitUntil(() => !!io.responseFor(44), "detached delegation response (id 44)");
+    const atResponse = progressFrames().length;
+    if (atResponse !== beforeDetached) {
+      throw new Error(
+        `(f2) a detached delegation must emit NO notifications/progress, got ${atResponse - beforeDetached} extra frames`
+      );
+    }
+    const handle = JSON.parse(contentText(io.responseFor(44), 44)) as { task_id?: string; status?: string };
+    if (handle.status !== "running" || typeof handle.task_id !== "string") {
+      throw new Error(`(f2) the detached call must return a running handle: ${JSON.stringify(handle)}`);
+    }
+
+    // (f3) The detached run finishes - and still says nothing on the wire.
+    let report: { finished?: boolean; result_ready?: boolean; status?: string; progress_bridge?: unknown } | undefined;
+    let pollId = 60;
+    const pollDeadline = Date.now() + 20_000;
+    while (Date.now() < pollDeadline) {
+      const pid = pollId++;
+      io.send({
+        jsonrpc: "2.0",
+        id: pid,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { stream_file: handle.task_id } },
+      });
+      await io.waitUntil(() => !!io.responseFor(pid), `watch poll (id ${pid})`);
+      const r = JSON.parse(contentText(io.responseFor(pid), pid)) as {
+        finished?: boolean;
+        result_ready?: boolean;
+        status?: string;
+        progress_bridge?: unknown;
+      };
+      if (r.running === false && r.result_ready === true) {
+        report = r;
+        break;
+      }
+      await sleep(200);
+    }
+    if (report?.status !== "success") {
+      throw new Error(`(f3) the detached run must complete successfully: ${JSON.stringify(report)}`);
+    }
+    detachedFrames = progressFrames().length - beforeDetached;
+    if (detachedFrames !== 0) {
+      throw new Error(
+        `(f3) a detached run must not emit notifications/progress after its response, got ${detachedFrames}`
+      );
+    }
+    if (report?.progress_bridge !== undefined) {
+      throw new Error(`(f3) the detached run's receipt must NOT carry progress_bridge: ${JSON.stringify(report)}`);
+    }
+  });
+  if (exitDetached !== 0) {
+    throw new Error(`(f) stdin EOF must end the server cleanly with exit 0, got ${exitDetached}`);
+  }
+
   console.log(
-    `progress bridge: ${noteCount} token-gated notifications (>=3 pre-result, progress strictly increasing from 0, fragments mirrored from .stream, == done last & ahead of the envelope); tokenless delegation emits 0: ok`
+    `progress bridge: ${noteCount} token-gated notifications (>=3 pre-result, progress strictly increasing from 0, fragments mirrored from .stream, == done last & ahead of the envelope); tokenless delegation emits 0; a detached (background) delegation emits 0 frames and no progress_bridge (${foregroundFrames} foreground frames on the same connection): ok`
   );
 }
 
