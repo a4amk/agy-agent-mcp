@@ -1,7 +1,7 @@
 {
   "name": "agy-agent-mcp",
   "version": "0.1.0",
-  "description": "MCP server that delegates tasks to the Antigravity (agy) CLI, subagent-style",
+  "description": "MCP server for subagent-style task delegation to the Antigravity (agy) CLI: headless runs, live stream transcripts, git-audited file scope. Works with OpenCode, Claude Code, and any MCP client.",
   "type": "module",
   "main": "src/index.ts",
   "bin": {
@@ -14,19 +14,27 @@
     "LICENSE"
   ],
   "license": "MIT",
+  "homepage": "https://github.com/a4amk/agy-agent-mcp#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/a4amk/agy-agent-mcp.git"
   },
   "keywords": [
     "mcp",
+    "mcp-server",
     "model-context-protocol",
     "antigravity",
+    "antigravity-cli",
     "agy",
     "subagent",
+    "subagents",
     "delegation",
+    "coding-agent",
+    "cli-agent",
+    "headless",
     "opencode",
-    "claude-code"
+    "claude-code",
+    "gemini"
   ],
   "scripts": {
     "start": "node src/index.ts",
