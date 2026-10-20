@@ -4,7 +4,7 @@
       {
         "name": "general_task",
         "title": "Run general-purpose Antigravity sub-agent task",
-        "description": "Delegate a general-purpose coding task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Defaults: mode accept-edits, effort medium (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no --effort is passed for it). The result carries the agent's final response, the resumable conversation_id, token usage, denied_actions, and the git-based files_touched/scope_violations audit when cwd is a git repo. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. File edits inside the task cwd never prompt; set edit_scope so out-of-scope changes are flagged in the audit. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
+        "description": "Delegate a general-purpose coding task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Pass background: true to detach instead: the call returns a task handle immediately and the run keeps going - a detached run emits NO notifications/progress (an MCP progress notification only belongs to a request that is still in flight), so watch_task is the detached run's progress channel. Defaults: mode accept-edits, effort medium (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no --effort is passed for it). The result carries the agent's final response, the resumable conversation_id, token usage, denied_actions, and the git-based files_touched/scope_violations audit when cwd is a git repo. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. File edits inside the task cwd never prompt; set edit_scope so out-of-scope changes are flagged in the audit. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -74,7 +74,7 @@
             },
             "background": {
               "type": "boolean",
-              "description": "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. Default: false."
+              "description": "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. A detached run emits NO notifications/progress: MCP progress notifications only apply while the request is in flight, and a detached call has already been answered - watch_task is its progress channel. Default: false."
             }
           },
           "required": [
@@ -90,7 +90,7 @@
       {
         "name": "explore_task",
         "title": "Run read-only Antigravity exploration task",
-        "description": "Delegate a fast read-only exploration and diagnosis task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Defaults: mode plan (read-only), effort low (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no --effort is passed for it); the mode preset is fixed, so callers cannot weaken the read-only posture. Produces answers and summaries without modifying files. Returns the same report as general_task, including the git-based files_touched/scope_violations audit. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
+        "description": "Delegate a fast read-only exploration and diagnosis task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Pass background: true to detach instead: the call returns a task handle immediately and the run keeps going - a detached run emits NO notifications/progress (an MCP progress notification only belongs to a request that is still in flight), so watch_task is the detached run's progress channel. Defaults: mode plan (read-only), effort low (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no --effort is passed for it); the mode preset is fixed, so callers cannot weaken the read-only posture. Produces answers and summaries without modifying files. Returns the same report as general_task, including the git-based files_touched/scope_violations audit. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -160,7 +160,7 @@
             },
             "background": {
               "type": "boolean",
-              "description": "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. Default: false."
+              "description": "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. A detached run emits NO notifications/progress: MCP progress notifications only apply while the request is in flight, and a detached call has already been answered - watch_task is its progress channel. Default: false."
             }
           },
           "required": [
@@ -176,7 +176,7 @@
       {
         "name": "watch_task",
         "title": "Watch live or recent task stream transcript",
-        "description": "Tails a task's live stream transcript. No args = latest run. Call it while a general_task/explore_task is in flight (this or any session) to watch the sub-agent work; the returned 'running' field plus 'modified' tell a live run from an abandoned one. For a live feed prefer the compact digest: 'steps' (one entry per read/write/run/phase with its target, duration and token cost), 'step_count', 'phase', 'elapsed_seconds' and 'usage_latest'. 'content' is the raw transcript tail - read it for detail, not for a status display. Once the run ends, the report carries the COMPLETE final result - the durable receipt's every field, the same result general_task/explore_task returns, so a failed run reports WHY it failed; 'result_ready' says the durable receipt has it.",
+        "description": "Tails a task's live stream transcript. No args = latest run. Call it while a general_task/explore_task is in flight (this or any session) to watch the sub-agent work; it is also the progress channel for a detached (background: true) run, which never emits notifications/progress. The returned 'running' field plus 'modified' tell a live run from an abandoned one. For a live feed prefer the compact digest: 'steps' (one entry per read/write/run/phase with its target, duration and token cost), 'step_count', 'phase', 'elapsed_seconds' and 'usage_latest'. 'content' is the raw transcript tail - read it for detail, not for a status display. Once the run ends, the report carries the COMPLETE final result - the durable receipt's every field, the same result general_task/explore_task returns, so a failed run reports WHY it failed; 'result_ready' says the durable receipt has it.",
         "inputSchema": {
           "type": "object",
           "properties": {
