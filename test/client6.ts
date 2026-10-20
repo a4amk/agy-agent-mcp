@@ -1166,7 +1166,7 @@ console.log("protocol parity vs test/goldens (bin -> dist): starting");
     timeout: 120_000,
   });
   const tgzName = packed.stdout.split("\n").filter(Boolean).pop();
-  if (!tgzName || !tgzName.endsWith(".tgz")) {
+  if (!tgzName?.endsWith(".tgz")) {
     throw new Error(`npm pack probe failed (exit ${packed.status}): ${packed.stderr}`);
   }
   const npm = spawnSync(
