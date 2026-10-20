@@ -52,3 +52,34 @@ GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci`, `npm run lint`, and `
 - Use concise, one-line commit messages.
 - When adding or modifying delegation tools (`general_task`, `explore_task`), inspection tools (`watch_task`), or discovery tools (`list_models`, `list_agents`), register them in `src/index.ts` using the shared delegation factory and option schema fragments.
 - Make sure `npm run lint` and `npm test` pass cleanly before opening a pull request (and `node test/client.ts` when changing live CLI integration).
+
+## Behavioral reference
+
+### Delegation result fields (`general_task` / `explore_task`)
+
+- `task_id` (`task_<8-hex-chars>`) — names both `<AGY_MCP_STATE_DIR>/<task_id>.ndjson` (`transcript_file`) and `<AGY_MCP_STATE_DIR>/<task_id>.stream` (`stream_file`), and is accepted directly by `watch_task` (`stream_file`).
+- `status` — `"success"` (exit code `0` and CLI `status: "SUCCESS"`), `"timeout"` (killed by the idle timer or opt-in wall ceiling via `SIGTERM` then `SIGKILL` after 5s), `"quota_error"`, or `"error"`.
+- `prompt` — echoed prompt, truncated to 200 characters (`…[truncated N chars]`).
+- `cwd` — resolved working directory (validated under `AGY_MCP_ROOT` when set).
+- `opencode_session_id` — echoed when OpenCode attaches `ai.opencode/sessionID` (`ses_...`) in request `_meta`.
+- `response` — CLI response text, truncated to the **last 20,000 characters** when longer (with `response_truncated: true`).
+- `response_empty` (`true`) and `response_empty_note` — attached when `status === "success"` but `response` is empty or whitespace, reminding the caller to check `denied_actions`, `files_touched`, and `notes`.
+- `duration_seconds` — taken from the CLI `result` event, falling back to measured wall-clock seconds when omitted; `num_turns` and `usage` are forwarded when reported by the CLI.
+- `conversation_id` and `resume_hint` — resumable Antigravity conversation UUID when reported by the CLI.
+- `denied_actions` — tool invocations auto-denied by headless mode; `auto_approve_applied` (`boolean`) is always present to record whether `--dangerously-skip-permissions` was actually passed.
+- `notes` — all non-JSON stdout lines plus stderr (stream-event lines excluded), capped at **4,000 characters**.
+- `files_touched` and `scope_violations` — git porcelain diff before vs. after the run when `cwd` is inside a git work tree, each capped at **50 entries**. `edit_scope` is an audit-and-replay control (the CLI writes files directly without prompting, and `--sandbox` only walls terminal commands); entries escaping `cwd` or `AGY_MCP_ROOT` are rejected before spawn.
+- `exit_code`, `error`, and `quota_note` — populated on non-success or quota-classified runs.
+
+### `watch_task` report and `.stream` format
+
+- `stream_file` input accepts an absolute path under `AGY_MCP_STATE_DIR`, a bare `task_<id>.stream` filename, or a task ID (`task_<id>` / `<id>`); omitting it selects the newest `task_<id>.stream` by mtime. Paths escaping `AGY_MCP_STATE_DIR` throw.
+- Returns `found`, `file`, `bytes`, `modified` (ISO timestamp), `running` (`!finished`), `finished` (whether a line starting with `== done:` is present), and `content` (last `tail_lines` lines, default `400`, `0` = all lines, hard-capped at the last **200,000 characters** with `clipped: true` and a leading `…\n`).
+- When `found` is `false`, returns up to 5 recent `candidates` (`task_<id>.stream`, newest first) and a `hint` pointing to the `.ndjson` machine log if a twin `task_<id>.ndjson` exists without a `.stream` file.
+- `.stream` rendering maps `init` to `session open · cwd=<cwd> · permission_mode=<mode> · tools=<n>`, `step_update` to `● user_input`, `● agent_response` (with flowed `text_delta` chunks and `  ⎿ done in <dur>s · <total_tokens> tokens[ · thinking <thinking_tokens>]`), and directional tool markers (`→ Read|View|Grep|List <target>`, `← Write|Edit <target>`, `$ <command>`, or `● <name>[ <target>]` followed by `  ⎿ [<output> · ]done in <dur>s`), closing with `== done: status=<status> · <dur>s` on `result`.
+
+### Quota detection, lifecycle, and logs
+
+- **Quota detection**: when a run fails (`status !== "success"`) or returns an empty response, `error`, `response`, and `notes` are scanned against quota/rate-limit patterns (`quota`, `rate limit`, `429`, `resource exhaust`, `credit`, `billing`, `usage limit`, `daily limit`, `fast forward`, `model capacity`). Matches upgrade `status` to `"quota_error"` and attach `quota_note` instructing the caller to inform the user rather than silently falling back to another agent.
+- **Machine logs & retention**: every run logs `task_start`, `spawn` (or `spawn_error`), `timeout` (`kind: "idle" | "wall"`), `exit`, `audit`, and `task_end` to `<AGY_MCP_STATE_DIR>/task_<id>.ndjson`. At startup, `sweepStateDir()` removes `task_*.ndjson` and `task_*.stream` files older than `AGY_MCP_RETENTION_DAYS` (default `7`; `0` disables).
+- **Shutdown**: on `SIGINT`, `SIGTERM`, or an unhandled `EPIPE` when the MCP client closes stdio mid-call, `shutdownRunner()` sends `SIGTERM` (and `SIGKILL` after 5s) to all in-flight headless child processes so orphaned runs do not burn model quota in the background.
