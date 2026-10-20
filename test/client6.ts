@@ -66,6 +66,10 @@
  *     - once finished, watch_task includes the final result with status success and response text;
  *     - a second delegation is rejected while the detached run holds the single-flight lock;
  *     - watch_task with cancel true stops a running detached task and the last report shows it stopped.
+ * 14. watch_task digest: the transcript is parsed into a compact step feed
+ *     (one entry per completed event with kind, label, target, duration and
+ *     token usage), plus phase, elapsed_seconds and usage_latest - while the
+ *     raw transcript tail stays available.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -2447,6 +2451,73 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     "handle-and-watch: background delegation returns running handle <1s, watch_task content grows, final result enriched on finish, lock held while running, cancel stops detached run: ok"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 14. watch_task digest: the compact step feed parsed out of the transcript
+// ---------------------------------------------------------------------------
+{
+  const digestRun = await fakeRun(streamBody, { prompt: "digest probe", cwd: ws });
+  const digestStream = path.join(digestRun.stateDir, `${digestRun.result.task_id}.stream`);
+  const report = runner.readStreamTail(digestStream);
+
+  const steps = report.steps ?? [];
+  if (!Array.isArray(steps) || steps.length !== 6) {
+    throw new Error(`digest must expose one step per completed event, got ${JSON.stringify(steps)}`);
+  }
+  if (report.step_count !== steps.length) {
+    throw new Error(`step_count must match the step list: ${report.step_count} vs ${steps.length}`);
+  }
+
+  const first = steps[0];
+  if (first?.kind !== "phase" || first.label !== "agent_response" || first.dur_seconds !== 4.07) {
+    throw new Error(`digest step 0 must be the agent_response phase with its duration: ${JSON.stringify(first)}`);
+  }
+  if (first.total_tokens !== 8093 || first.thinking_tokens !== 38) {
+    throw new Error(`digest step 0 must carry the step token usage: ${JSON.stringify(first)}`);
+  }
+
+  const writeStep = steps[1];
+  if (
+    writeStep?.kind !== "write" ||
+    writeStep.label !== "Write" ||
+    writeStep.target !== "/tmp/opencode/agy-tmux-test/probe.txt" ||
+    writeStep.dur_seconds !== 1.816
+  ) {
+    throw new Error(`digest step 1 must be the write step with target and duration: ${JSON.stringify(writeStep)}`);
+  }
+
+  const readStep = steps[2];
+  if (
+    readStep?.kind !== "read" ||
+    readStep.label !== "Read" ||
+    readStep.target !== "/tmp/opencode/agy-tmux-test/probe.txt" ||
+    readStep.dur_seconds !== 0.027 ||
+    readStep.output !== "1 lines, 6 bytes"
+  ) {
+    throw new Error(`digest step 2 must be the read step with output excerpt: ${JSON.stringify(readStep)}`);
+  }
+
+  const runStep = steps[4];
+  if (runStep?.kind !== "run" || runStep.target !== "git status" || runStep.dur_seconds !== 1.1) {
+    throw new Error(`digest step 4 must be the run step with its command: ${JSON.stringify(runStep)}`);
+  }
+
+  if (report.phase !== "Web") {
+    throw new Error(`digest phase must be the last phase marker: ${report.phase}`);
+  }
+  if (report.elapsed_seconds !== 6.55) {
+    throw new Error(`digest elapsed_seconds must come from the done marker: ${report.elapsed_seconds}`);
+  }
+  if (report.usage_latest?.total_tokens !== 8007 || report.usage_latest?.thinking_tokens !== 9) {
+    throw new Error(`digest usage_latest must be the newest step usage: ${JSON.stringify(report.usage_latest)}`);
+  }
+  if (typeof report.content !== "string" || !report.content.includes("== done:")) {
+    throw new Error("the raw transcript tail must stay available next to the digest");
+  }
+  console.log(
+    "watch digest: 6 structured steps (phase/write/read/run) with targets, durations and token usage, phase + elapsed + usage_latest, raw tail retained: ok"
   );
 }
 

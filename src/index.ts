@@ -546,7 +546,11 @@ const TOOLS: ToolSpec[] = [
     description:
       "Tails a task's live stream transcript. No args = latest run. Call it while a general_task/explore_task " +
       "is in flight (this or any session) to watch the sub-agent work; the returned 'running' field plus " +
-      "'modified' tell a live run from an abandoned one.",
+      "'modified' tell a live run from an abandoned one. For a live feed prefer the compact digest: 'steps' " +
+      "(one entry per read/write/run/phase with its target, duration and token cost), 'step_count', 'phase', " +
+      "'elapsed_seconds' and 'usage_latest'. 'content' is the raw transcript tail - read it for detail, not " +
+      "for a status display. Once the run ends, the report also carries the final result (status, response, " +
+      "usage, files_touched, scope_violations); 'result_ready' says the durable receipt has it.",
     inputSchema: WATCH_INPUT_SCHEMA,
     handler: async (args) => {
       try {
