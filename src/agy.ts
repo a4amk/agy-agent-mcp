@@ -40,7 +40,7 @@ export const ALLOW_AUTO_APPROVE = !boolEnv("AGY_MCP_DENY_AUTO_APPROVE", false);
 /** Root dir restriction: when set, all task cwds must live under it. */
 export const ROOT = process.env.AGY_MCP_ROOT ? path.resolve(process.env.AGY_MCP_ROOT) : null;
 
-const STATE_DIR = process.env.AGY_MCP_STATE_DIR || path.join(os.tmpdir(), "agy-agent-mcp", "tasks");
+export const STATE_DIR = process.env.AGY_MCP_STATE_DIR || path.join(os.tmpdir(), "agy-agent-mcp", "tasks");
 
 /** Response text is truncated to this size in tool results (tail kept). */
 const MAX_RESPONSE_CHARS = 20_000;
@@ -95,8 +95,9 @@ export interface TaskOptions {
    * consumers assemble lines themselves). Absent hooks keep runner behavior
    * byte-identical.
    */
-  onTaskStart?: (taskId: string, streamPath: string) => void;
+  onTaskStart?: (taskId: string, streamPath: string, transcriptPath?: string) => void;
   onStreamLine?: (text: string) => void;
+  getProgressBridge?: () => { token: string | number; notifications: number; mirrored_lines: number };
   signal?: AbortSignal;
 }
 
@@ -138,6 +139,13 @@ export interface TaskResult {
   response_empty?: true;
   response_empty_note?: string;
   resume_hint?: string;
+  /**
+   * Present when the client opted into progress (a _meta.progressToken was
+   * supplied): how many notifications/progress frames the server wrote and how
+   * many transcript lines were mirrored. Filled in by the MCP layer, which owns
+   * the bridge; absent for tokenless calls.
+   */
+  progress_bridge?: { token: string | number; notifications: number; mirrored_lines: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -818,7 +826,7 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
   if (opts.signal?.aborted) {
     const error = "task was cancelled before execution started";
     logEvent(task, { event: "abort", error });
-    return {
+    const result: TaskResult = {
       task_id: task.id,
       status: "error",
       auto_approve_applied: task.autoApproveApplied,
@@ -831,6 +839,9 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
       transcript_file: task.transcriptFile,
       stream_file: task.streamFile,
     };
+    logEvent(task, { event: "task_end", status: result.status, error: result.error });
+    logEvent(task, { event: "result", result });
+    return result;
   }
 
   let child: ChildProcess;
@@ -839,7 +850,7 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
   } catch (err) {
     const error = `failed to spawn ${AGY_BIN}: ${(err as Error).message}`;
     logEvent(task, { event: "spawn_error", error });
-    return {
+    const result: TaskResult = {
       task_id: task.id,
       status: "error",
       auto_approve_applied: task.autoApproveApplied,
@@ -852,6 +863,9 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
       transcript_file: task.transcriptFile,
       stream_file: task.streamFile,
     };
+    logEvent(task, { event: "task_end", status: result.status, error: result.error });
+    logEvent(task, { event: "result", result });
+    return result;
   }
   logEvent(task, { event: "spawn", code: 0, ms: Date.now() - t0, pid: child.pid });
 
@@ -892,7 +906,7 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
   // Progress bridge start: fired exactly once, before any mirrored line, right
   // after the child spawned and the .stream file exists — the earliest point a
   // caller can associate taskId with streamPath.
-  opts.onTaskStart?.(task.id, task.streamFile);
+  opts.onTaskStart?.(task.id, task.streamFile, task.transcriptFile);
 
   const triggerKill = (kind: "idle" | "wall", ms: number) => {
     if (killedKind !== null) return;
@@ -1088,7 +1102,15 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
     if (audit.scope_violations) result.scope_violations = audit.scope_violations;
   }
 
+  if (opts.getProgressBridge) {
+    result.progress_bridge = opts.getProgressBridge();
+  }
+  if (killedKind === "abort") {
+    appendStreamText(task.streamFile, `== done: status=CANCELLED · ${result.duration_seconds ?? 0}s\n`);
+  }
+
   logEvent(task, { event: "task_end", status: result.status, error: result.error });
+  logEvent(task, { event: "result", result });
   return result;
 }
 
@@ -1246,10 +1268,25 @@ export interface WatchTaskReport {
   modified?: string;
   running?: boolean;
   finished?: boolean;
+  /**
+   * True once the durable receipt (task_<id>.ndjson) carries the final result.
+   * The stream's "== done:" line appears when the CLI finishes, which is
+   * slightly BEFORE the server writes the receipt (it audits the file scope
+   * first) - so poll on result_ready, not on finished, to get the result.
+   */
+  result_ready?: boolean;
   clipped?: true;
   content?: string;
+  content_len?: number;
   hint?: string;
   candidates?: string[];
+  status?: TaskStatus;
+  response?: string;
+  duration_seconds?: number;
+  usage?: Record<string, unknown>;
+  files_touched?: string[];
+  scope_violations?: string[];
+  progress_bridge?: { token: string | number; notifications: number; mirrored_lines: number };
 }
 
 /**
@@ -1324,6 +1361,28 @@ export function resolveStreamFile(
 }
 
 /**
+ * Read the final TaskResult from a .ndjson receipt if present.
+ */
+export function readNdjsonResult(ndjsonPath: string): TaskResult | null {
+  if (!existsSync(ndjsonPath)) return null;
+  try {
+    const raw = readFileSync(ndjsonPath, "utf8");
+    const lines = raw.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      const parsed = tryParseJsonObject(line);
+      if (parsed && parsed.event === "result" && parsed.result && typeof parsed.result === "object") {
+        return parsed.result as TaskResult;
+      }
+    }
+  } catch {
+    /* receipt read is best-effort */
+  }
+  return null;
+}
+
+/**
  * Read the tail of a `.stream` file (`tailLines` = 0 returns all lines),
  * cap the returned content at `charLimit` characters from the newest end, and
  * classify `finished` / `running` by the presence of a `== done:` line.
@@ -1346,7 +1405,9 @@ export function readStreamTail(
   const normalized = raw.replace(/\r\n/g, "\n");
   const body = normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
   const lines = body.length === 0 ? [] : body.split("\n");
-  const finished = lines.some((l) => l.startsWith("== done:"));
+  const ndjsonPath = filePath.replace(/\.stream$/, ".ndjson");
+  const receipt = readNdjsonResult(ndjsonPath);
+  const finished = lines.some((l) => l.startsWith("== done:")) || receipt !== null;
   const running = !finished;
 
   let clipped = false;
@@ -1373,9 +1434,20 @@ export function readStreamTail(
     modified: st.mtime.toISOString(),
     running,
     finished,
+    result_ready: receipt !== null,
     content,
+    content_len: content.length,
   };
   if (clipped) report.clipped = true;
+  if (finished && receipt) {
+    if (receipt.status !== undefined) report.status = receipt.status;
+    if (receipt.response !== undefined) report.response = receipt.response;
+    if (receipt.duration_seconds !== undefined) report.duration_seconds = receipt.duration_seconds;
+    if (receipt.usage !== undefined) report.usage = receipt.usage;
+    if (receipt.files_touched !== undefined) report.files_touched = receipt.files_touched;
+    if (receipt.scope_violations !== undefined) report.scope_violations = receipt.scope_violations;
+    if (receipt.progress_bridge !== undefined) report.progress_bridge = receipt.progress_bridge;
+  }
   return report;
 }
 
@@ -1384,7 +1456,12 @@ export function readStreamTail(
  * `streamFile` is omitted, or resolves `streamFile` within `stateDir`. Throws
  * only on path-validation errors (escaping paths).
  */
-export function watchTask(opts?: { streamFile?: string; tailLines?: number; stateDir?: string }): WatchTaskReport {
+export function watchTask(opts?: {
+  streamFile?: string;
+  tailLines?: number;
+  stateDir?: string;
+  cancel?: boolean;
+}): WatchTaskReport {
   const stateDir = path.resolve(opts?.stateDir ?? STATE_DIR);
   const tailLines = opts?.tailLines ?? DEFAULT_TAIL_LINES;
   const candidates = listStreamFiles(stateDir).slice(0, 5);

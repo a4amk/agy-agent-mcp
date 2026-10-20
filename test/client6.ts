@@ -60,6 +60,12 @@
  *       kills child and releases lock so next delegation is accepted;
  *     - follow CLI argument parsing: bare -- end-of-options delimiter forwards
  *       prompt containing -- verbatim to the agent.
+ * 13. Handle-and-watch workflow (background delegation, polling, and cancellation):
+ *     - background delegation returns in well under a second with status "running" and a task id;
+ *     - polling watch_task shows running true and transcript content that grows between polls;
+ *     - once finished, watch_task includes the final result with status success and response text;
+ *     - a second delegation is rejected while the detached run holds the single-flight lock;
+ *     - watch_task with cancel true stops a running detached task and the last report shows it stopped.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -2207,6 +2213,240 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     "verified audit fixes: hash-based touch detection, exit-fallback hygiene, cancellation lock release, -- CLI delimiter: ok"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 13. Handle-and-watch workflow (background delegation, polling, and cancellation)
+// ---------------------------------------------------------------------------
+{
+  const slowAgy = writeSlowAgy();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "agy-watch-workflow-"));
+  const { exitCode } = await driveMcpStdio(slowAgy, stateDir, async (io) => {
+    io.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: HANDSHAKE("handle-and-watch-probe"),
+    });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
+
+    // 1. A backgrounded delegation returns in well under a second with status "running" and a task id.
+    const t0 = Date.now();
+    io.send({
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: {
+        name: "general_task",
+        arguments: { prompt: "detached delegation task", cwd: stateDir, background: true },
+      },
+    });
+    await io.waitUntil(() => !!io.responseFor(10), "background delegation response (id 10)");
+    const elapsed = Date.now() - t0;
+    if (elapsed >= 1000) {
+      throw new Error(`backgrounded delegation must return in well under a second, took ${elapsed}ms`);
+    }
+    const bgReceipt = JSON.parse(contentText(io.responseFor(10), 10)) as {
+      task_id?: string;
+      status?: string;
+      stream_file?: string;
+      transcript_file?: string;
+      started?: boolean;
+      note?: string;
+    };
+    if (
+      bgReceipt.status !== "running" ||
+      typeof bgReceipt.task_id !== "string" ||
+      !bgReceipt.task_id.startsWith("task_")
+    ) {
+      throw new Error(`background receipt must have status "running" and a task_id: ${JSON.stringify(bgReceipt)}`);
+    }
+    if (bgReceipt.started !== true) {
+      throw new Error(`background receipt must report started: true: ${JSON.stringify(bgReceipt)}`);
+    }
+    if (typeof bgReceipt.stream_file !== "string" || typeof bgReceipt.transcript_file !== "string") {
+      throw new Error(`background receipt must include stream_file and transcript_file: ${JSON.stringify(bgReceipt)}`);
+    }
+
+    // 2. A second delegation is rejected while the detached run holds the single-flight lock.
+    io.send({
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: {
+        name: "explore_task",
+        arguments: { prompt: "second task while detached is in flight", cwd: stateDir },
+      },
+    });
+    await io.waitUntil(() => !!io.responseFor(11), "rejection response (id 11)");
+    const busy = io.responseFor(11);
+    if (busy?.result?.isError !== true) {
+      throw new Error(`second delegation must be rejected while detached run is in flight: ${JSON.stringify(busy)}`);
+    }
+    const rejMsg = contentText(busy, 11);
+    if (!rejMsg.includes("another delegation is already running") || !rejMsg.includes(bgReceipt.task_id)) {
+      throw new Error(`rejection message must name the in-flight task id (${bgReceipt.task_id}): ${rejMsg}`);
+    }
+
+    // 3. Polling watch_task on it shows running true and content that grows between two polls.
+    io.send({
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: { name: "watch_task", arguments: { stream_file: bgReceipt.task_id } },
+    });
+    await io.waitUntil(() => !!io.responseFor(12), "watch poll 1 (id 12)");
+    const poll1 = JSON.parse(contentText(io.responseFor(12), 12)) as {
+      found?: boolean;
+      running?: boolean;
+      finished?: boolean;
+      content?: string;
+    };
+    if (poll1.found !== true || poll1.running !== true || poll1.finished !== false) {
+      throw new Error(`watch poll 1 must show running true and finished false: ${JSON.stringify(poll1)}`);
+    }
+    const content1 = poll1.content ?? "";
+
+    // Wait for the slow fake agy to emit its next step (sleep 0.5s in SLOW_STREAM_BODY)
+    await sleep(650);
+
+    io.send({
+      jsonrpc: "2.0",
+      id: 13,
+      method: "tools/call",
+      params: { name: "watch_task", arguments: { stream_file: bgReceipt.task_id } },
+    });
+    await io.waitUntil(() => !!io.responseFor(13), "watch poll 2 (id 13)");
+    const poll2 = JSON.parse(contentText(io.responseFor(13), 13)) as {
+      content?: string;
+    };
+    const content2 = poll2.content ?? "";
+    if (content2.length <= content1.length) {
+      throw new Error(
+        `transcript content must grow between two polls: poll1=${content1.length} chars, poll2=${content2.length} chars`
+      );
+    }
+
+    // 4. Once the task finishes, watch_task includes the final result with status success and response text.
+    let finishedReport:
+      | {
+          running?: boolean;
+          finished?: boolean;
+          result_ready?: boolean;
+          status?: string;
+          response?: string;
+          duration_seconds?: number;
+        }
+      | undefined;
+    let pollId = 20;
+    const pollDeadline = Date.now() + 20_000;
+    while (!finishedReport && Date.now() < pollDeadline) {
+      const pid = pollId++;
+      io.send({
+        jsonrpc: "2.0",
+        id: pid,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { stream_file: bgReceipt.task_id } },
+      });
+      await io.waitUntil(() => !!io.responseFor(pid), `poll id ${pid}`);
+      const r = JSON.parse(contentText(io.responseFor(pid), pid)) as {
+        running?: boolean;
+        finished?: boolean;
+        result_ready?: boolean;
+        status?: string;
+        response?: string;
+      };
+      // result_ready (the durable receipt carries the final result) is the
+      // authoritative completion signal - the stream's "== done:" line lands
+      // slightly earlier, before the server finishes the file-scope audit.
+      if (r.running === false && r.result_ready === true) {
+        finishedReport = r;
+        break;
+      }
+      await sleep(200);
+    }
+
+    if (finishedReport?.status !== "success") {
+      throw new Error(`finished watch report must include status "success", got: ${JSON.stringify(finishedReport)}`);
+    }
+    if (typeof finishedReport.response !== "string" || !finishedReport.response.includes("working on it hard")) {
+      throw new Error(`finished watch report must include response text: ${JSON.stringify(finishedReport)}`);
+    }
+    if (typeof finishedReport.duration_seconds !== "number" || finishedReport.duration_seconds <= 0) {
+      throw new Error(`finished watch report must include duration_seconds: ${JSON.stringify(finishedReport)}`);
+    }
+
+    // 5. watch_task with cancel true stops a running detached task and the last report shows it stopped.
+    io.send({
+      jsonrpc: "2.0",
+      id: 30,
+      method: "tools/call",
+      params: {
+        name: "general_task",
+        arguments: { prompt: "detached task to cancel", cwd: stateDir, background: true },
+      },
+    });
+    await io.waitUntil(() => !!io.responseFor(30), "background delegation response for cancel (id 30)");
+    const bgCancelReceipt = JSON.parse(contentText(io.responseFor(30), 30)) as { task_id?: string; status?: string };
+    if (bgCancelReceipt.status !== "running" || typeof bgCancelReceipt.task_id !== "string") {
+      throw new Error(`task to cancel must start running: ${JSON.stringify(bgCancelReceipt)}`);
+    }
+
+    io.send({
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: {
+        name: "watch_task",
+        arguments: { stream_file: bgCancelReceipt.task_id, cancel: true },
+      },
+    });
+    await io.waitUntil(() => !!io.responseFor(31), "watch cancel response (id 31)");
+    const cancelReport = JSON.parse(contentText(io.responseFor(31), 31)) as {
+      running?: boolean;
+      finished?: boolean;
+      status?: string;
+      content?: string;
+    };
+    if (cancelReport.running !== false || cancelReport.finished !== true) {
+      throw new Error(
+        `cancelled watch report must show stopped (running: false, finished: true): ${JSON.stringify(cancelReport)}`
+      );
+    }
+    if (cancelReport.status !== "error") {
+      throw new Error(`cancelled watch report status must be "error", got: ${JSON.stringify(cancelReport)}`);
+    }
+    if (!cancelReport.content?.includes("CANCELLED")) {
+      throw new Error(
+        `cancelled watch report content must reflect cancellation marker: ${JSON.stringify(cancelReport)}`
+      );
+    }
+
+    // Verify lock release: a new delegation immediately succeeds (not rejected under lock)
+    io.send({
+      jsonrpc: "2.0",
+      id: 32,
+      method: "tools/call",
+      params: {
+        name: "general_task",
+        arguments: { prompt: "run after cancel", cwd: stateDir, background: true },
+      },
+    });
+    await io.waitUntil(() => !!io.responseFor(32), "delegation after cancel response (id 32)");
+    const afterCancel = io.responseFor(32);
+    if (afterCancel?.result?.isError === true) {
+      throw new Error(`delegation after cancel was rejected under lock: ${JSON.stringify(afterCancel)}`);
+    }
+  });
+
+  if (exitCode !== 0) {
+    throw new Error(`handle-and-watch suite must exit 0, got ${exitCode}`);
+  }
+
+  console.log(
+    "handle-and-watch: background delegation returns running handle <1s, watch_task content grows, final result enriched on finish, lock held while running, cancel stops detached run: ok"
   );
 }
 

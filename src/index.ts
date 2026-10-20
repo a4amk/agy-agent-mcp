@@ -23,8 +23,10 @@ import {
   DEFAULT_PRINT_TIMEOUT_MS,
   RETENTION_DAYS,
   ROOT,
+  resolveStreamFile,
   runCmd,
   runTask,
+  STATE_DIR,
   shutdownRunner,
   sweepStateDir,
   type TaskOptions,
@@ -123,6 +125,11 @@ const DELEGATION_INPUT_SCHEMA: InputSchema = {
       description:
         "Idle timeout for the run in ms (0..3600000; 0 disables the idle kill for this run). Resets on every stdout/stderr chunk from the child; kicks in after this much child silence and kills the child (SIGTERM, then SIGKILL after 5s). Default: 900000 (AGY_MCP_IDLE_TIMEOUT_MS).",
     },
+    background: {
+      type: "boolean",
+      description:
+        "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. Default: false.",
+    },
   },
   required: ["prompt"],
   additionalProperties: false,
@@ -144,6 +151,11 @@ const WATCH_INPUT_SCHEMA: InputSchema = {
       maximum: 2000,
       description:
         "Number of trailing lines to return (1..2000, default 400; 0 returns the full transcript, hard-capped at 200,000 chars).",
+    },
+    cancel: {
+      type: "boolean",
+      description:
+        "When true and the watched task is still running, stop that run immediately (kill the child process, release the delegation lock, and report the run as cancelled).",
     },
   },
   additionalProperties: false,
@@ -240,6 +252,8 @@ let activeDelegation: {
   taskId?: string;
   streamPath?: string;
   abort?: () => void;
+  detached?: boolean;
+  promise?: Promise<unknown>;
 } | null = null;
 
 /** House tool-error envelope naming the in-flight run (or the tool if it has not reported a task yet). */
@@ -295,6 +309,7 @@ function progressTokenArg(params: Args): string | number | undefined {
 function progressBridgeFor(token: string | number) {
   const bridge = {
     sent: 0, // last progress value emitted (0 = the task-started notification)
+    notifications: 0, // how many notifications/progress frames were written
     started: false,
     finished: false,
     count: 0, // completed mirrored lines so far (the strictly increasing counter)
@@ -310,6 +325,7 @@ function progressBridgeFor(token: string | number) {
       params: { progressToken: token, progress, message },
     });
     bridge.sent = progress;
+    bridge.notifications += 1;
   };
 
   const messageText = () =>
@@ -358,6 +374,16 @@ function progressBridgeFor(token: string | number) {
       }
       if (bridge.count > bridge.sent) sendProgress(bridge.count, messageText());
     },
+    /**
+     * What the bridge actually did for this call. Reported in the task receipt
+     * so a client (or a reviewer reading the receipt) can see whether the
+     * client opted into progress at all and how many notifications were
+     * written - the difference between "the server streamed" and "the client
+     * rendered it".
+     */
+    stats(): { token: string | number; notifications: number; mirrored_lines: number } {
+      return { token, notifications: bridge.notifications, mirrored_lines: bridge.count };
+    },
   };
 }
 
@@ -375,24 +401,98 @@ async function runDelegation(
 ): Promise<ToolResult> {
   const token = progressTokenArg(params);
   const bridge = token === undefined ? null : progressBridgeFor(token);
+  if (bridge) {
+    // Visible in the server log: the client opted into progress for this call.
+    process.stderr.write(`[${SERVER_NAME}] progress bridge active (token=${String(token)})\n`);
+  }
   const opts = toOptions(args, opencodeSessionID(params), presets);
   if (signal) opts.signal = signal;
-  // Always wired, token or no token: the single-flight lock needs the
-  // in-flight taskId/streamPath the instant the run starts — before any line
-  // streams — so its rejection message can name them. With a token the bridge
-  // additionally mirrors the start notification.
-  opts.onTaskStart = (taskId, streamPath) => {
+
+  const background = boolArg(args, "background") ?? false;
+  // A holder rather than a plain variable: the receipt is filled by the
+  // onTaskStart callback (which fires synchronously inside runTask, before its
+  // first await), and TypeScript's control-flow analysis cannot see an
+  // assignment made from inside a closure.
+  const started: {
+    receipt: {
+      task_id: string;
+      status: "running";
+      stream_file: string;
+      transcript_file: string;
+      started: true;
+      note: string;
+    } | null;
+  } = { receipt: null };
+
+  opts.onTaskStart = (taskId, streamPath, transcriptPath) => {
     if (activeDelegation) {
       activeDelegation.taskId = taskId;
       activeDelegation.streamPath = streamPath;
     }
+    const transcript = transcriptPath ?? streamPath.replace(/\.stream$/, ".ndjson");
+    started.receipt = {
+      task_id: taskId,
+      status: "running",
+      stream_file: streamPath,
+      transcript_file: transcript,
+      started: true,
+      note: "poll watch_task with this task_id until running is false - the final result is included in the last poll",
+    };
     bridge?.onTaskStart(taskId, streamPath);
   };
   if (bridge) {
     opts.onStreamLine = (text) => bridge.onStreamLine(text);
+    opts.getProgressBridge = () => {
+      bridge.finish();
+      return bridge.stats();
+    };
   }
+
+  if (background) {
+    try {
+      const runPromise = runTask(opts);
+      if (activeDelegation) {
+        activeDelegation.detached = true;
+        activeDelegation.promise = runPromise;
+      }
+      const taskId = started.receipt ? started.receipt.task_id : activeDelegation?.taskId;
+      runPromise
+        .then((result) => {
+          if (bridge) result.progress_bridge = bridge.stats();
+          return result;
+        })
+        .catch((err) => {
+          process.stderr.write(`[${SERVER_NAME}] detached run error: ${(err as Error).message}\n`);
+        })
+        .finally(() => {
+          bridge?.finish();
+          if (activeDelegation?.taskId === taskId) {
+            activeDelegation = null;
+          }
+        });
+
+      if (started.receipt) {
+        return textResult(started.receipt);
+      }
+      const result = await runPromise;
+      if (bridge) result.progress_bridge = bridge.stats();
+      return textResult(result, result.status !== "success");
+    } catch (err) {
+      if (activeDelegation) activeDelegation = null;
+      return textResult({ error: (err as Error).message }, true);
+    }
+  }
+
   try {
-    const result = await runTask(opts);
+    const runPromise = runTask(opts);
+    if (activeDelegation) {
+      activeDelegation.promise = runPromise;
+    }
+    const result = await runPromise;
+    // The receipt says whether the client asked for progress and how much was
+    // streamed, so "the server streamed but the client showed nothing" is
+    // distinguishable from "the client never opted in".
+    if (bridge) result.progress_bridge = bridge.stats();
     return textResult(result);
   } catch (err) {
     return textResult({ error: (err as Error).message }, true);
@@ -450,10 +550,46 @@ const TOOLS: ToolSpec[] = [
     inputSchema: WATCH_INPUT_SCHEMA,
     handler: async (args) => {
       try {
+        const streamFile = stringArg(args, "stream_file");
+        const tailLines = intArg(args, "tail_lines", 0, 2000);
+        const cancel = boolArg(args, "cancel") ?? false;
+        if (cancel && activeDelegation) {
+          let shouldCancel = false;
+          if (!streamFile) {
+            shouldCancel = true;
+          } else {
+            const resolved = resolveStreamFile(STATE_DIR, streamFile);
+            if (!("error" in resolved)) {
+              if (
+                activeDelegation.streamPath === resolved.path ||
+                activeDelegation.taskId === streamFile ||
+                (activeDelegation.taskId && resolved.path.includes(activeDelegation.taskId))
+              ) {
+                shouldCancel = true;
+              }
+            }
+          }
+          if (shouldCancel) {
+            try {
+              activeDelegation.abort?.();
+            } catch {
+              /* abort callback error swallowed */
+            }
+            if (activeDelegation.promise) {
+              try {
+                await activeDelegation.promise;
+              } catch {
+                /* promise rejection swallowed */
+              }
+            }
+            activeDelegation = null;
+          }
+        }
         return textResult(
           watchTask({
-            streamFile: stringArg(args, "stream_file"),
-            tailLines: intArg(args, "tail_lines", 0, 2000),
+            streamFile,
+            tailLines,
+            cancel,
           })
         );
       } catch (err) {
@@ -572,7 +708,7 @@ function toolsCall(params: Args, id: JsonRpcId): void | Promise<void> {
     )
     .finally(() => {
       // Released in finally so timeout kills and run errors release it too.
-      if (isDelegation && activeDelegation?.requestId === id) {
+      if (isDelegation && activeDelegation?.requestId === id && !activeDelegation.detached) {
         activeDelegation = null;
       }
     });
