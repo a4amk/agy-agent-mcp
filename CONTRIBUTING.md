@@ -49,7 +49,16 @@ GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci`, `npm run lint`, and `
 ## Pull requests
 
 - Target the `main` branch and keep pull requests focused on a single change.
-- Use concise, one-line commit messages.
+- Use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages:
+  - **Subject**: `<type>(<scope>): <imperative summary>`, lowercase after the prefix, no trailing
+    period, at most 72 characters. Allowed types: `feat`, `fix`, `docs`, `refactor`, `perf`,
+    `test`, `build`, `ci`, `chore`, `revert`.
+  - **Body**: required whenever the subject alone does not explain *what changed and why*.
+    Separate it from the subject with one blank line, wrap it at 72 characters, and prefer prose
+    over bullet lists. Explain the motivation (the bug, the contract that was broken) before the
+    implementation details.
+  - **Footer**: optional `BREAKING CHANGE:` notes and issue references, separated by a blank line.
+  - One logical change per commit; do not mix a fix with an unrelated refactor.
 - When adding or modifying delegation tools (`general_task`, `explore_task`), inspection tools (`watch_task`), or discovery tools (`list_models`, `list_agents`), add an entry to the five-tool table in `src/index.ts` (title, description, hand-written `inputSchema` literal, and handler); the `test/goldens/` files capture the exact wire shape and must stay in deep agreement.
 - Make sure `npm run lint` and `npm test` pass cleanly before opening a pull request (and `node test/client.ts` when changing live CLI integration).
 
