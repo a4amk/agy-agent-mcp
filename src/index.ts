@@ -21,9 +21,7 @@ import {
   ALLOW_AUTO_APPROVE,
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_PRINT_TIMEOUT_MS,
-  EFFORT_LEVELS,
   type EffortLevel,
-  isEffortLevel,
   modelTier,
   RETENTION_DAYS,
   ROOT,
@@ -49,7 +47,31 @@ const { version: SERVER_VERSION } = JSON.parse(readFileSync(new URL("../package.
 // ---------------------------------------------------------------------------
 
 type Args = Record<string, unknown>;
-type InputSchema = Record<string, unknown>;
+
+/**
+ * The JSON Schema subset this server advertises in tools/list and enforces
+ * at call time. The schema literals below are the single source of truth:
+ * the validator READS them, it never re-declares a rule in a second place.
+ */
+interface SchemaProperty {
+  type?: "string" | "boolean" | "integer" | "number" | "array" | "object";
+  enum?: readonly unknown[];
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  minItems?: number;
+  pattern?: string;
+  items?: { type?: SchemaProperty["type"] };
+  description?: string;
+}
+
+interface Schema {
+  $schema?: string;
+  type?: "object";
+  properties?: Record<string, SchemaProperty>;
+  required?: string[];
+  additionalProperties?: boolean;
+}
 
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
@@ -60,18 +82,19 @@ interface ToolSpec {
   name: string;
   title: string;
   description: string;
-  inputSchema: InputSchema;
+  inputSchema: Schema;
   handler: (args: Args, params: Args, signal?: AbortSignal) => Promise<ToolResult>;
 }
 
-const DELEGATION_INPUT_SCHEMA: InputSchema = {
+const DELEGATION_INPUT_SCHEMA: Schema = {
   type: "object",
   properties: {
     prompt: {
       type: "string",
       minLength: 1,
+      pattern: "\\S",
       description:
-        "Full, self-contained task description for the sub-agent. Include all needed context and file paths.",
+        "Full, self-contained task description for the sub-agent. Include all needed context and file paths. Must not be empty or whitespace only.",
     },
     conversation_id: {
       type: "string",
@@ -141,7 +164,7 @@ const DELEGATION_INPUT_SCHEMA: InputSchema = {
   $schema: "http://json-schema.org/draft-07/schema#",
 };
 
-const WATCH_INPUT_SCHEMA: InputSchema = {
+const WATCH_INPUT_SCHEMA: Schema = {
   type: "object",
   properties: {
     stream_file: {
@@ -167,11 +190,132 @@ const WATCH_INPUT_SCHEMA: InputSchema = {
   $schema: "http://json-schema.org/draft-07/schema#",
 };
 
-const EMPTY_INPUT_SCHEMA: InputSchema = {
+const EMPTY_INPUT_SCHEMA: Schema = {
   $schema: "http://json-schema.org/draft-07/schema#",
   type: "object",
   properties: {},
+  additionalProperties: false,
 };
+
+// ---------------------------------------------------------------------------
+// Schema-driven input validation
+// ---------------------------------------------------------------------------
+
+/** The JSON type of a value, named the way the schema names types. */
+function jsonTypeOf(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+/** "a string" / "an integer" ... - the article fits the type name. */
+const TYPE_ARTICLE: Record<NonNullable<SchemaProperty["type"]>, string> = {
+  string: "a string",
+  boolean: "a boolean",
+  integer: "an integer",
+  number: "a number",
+  array: "an array",
+  object: "an object",
+};
+
+/** Whether a value satisfies a schema `type` keyword. */
+function matchesType(type: SchemaProperty["type"], value: unknown): boolean {
+  switch (type) {
+    case "string":
+      return typeof value === "string";
+    case "boolean":
+      return typeof value === "boolean";
+    case "integer":
+      return typeof value === "number" && Number.isInteger(value);
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
+    case "array":
+      return Array.isArray(value);
+    case "object":
+      return typeof value === "object" && value !== null && !Array.isArray(value);
+    default:
+      return true;
+  }
+}
+
+/**
+ * Validate one property value against its schema. Returns null when the
+ * value is acceptable, or a message naming the offending argument.
+ */
+function validateProperty(key: string, schema: SchemaProperty, value: unknown): string | null {
+  // An absent property is not a violation: the tool's default applies.
+  if (value === undefined) return null;
+  // The enum is checked first: its message names the accepted values, and for
+  // `effort` it is the exact message this server has always used.
+  if (schema.enum && !schema.enum.includes(value)) {
+    return `${key} must be one of ${schema.enum.join("|")}, got: ${String(value)}`;
+  }
+  if (schema.type && !matchesType(schema.type, value)) {
+    return `${key} must be ${TYPE_ARTICLE[schema.type]}, got: ${jsonTypeOf(value)}`;
+  }
+  if (typeof value === "number") {
+    if (schema.minimum !== undefined && value < schema.minimum) {
+      return `${key} must be >= ${schema.minimum}, got: ${value}`;
+    }
+    if (schema.maximum !== undefined && value > schema.maximum) {
+      return `${key} must be <= ${schema.maximum}, got: ${value}`;
+    }
+  }
+  if (typeof value === "string") {
+    if (schema.minLength !== undefined && value.length < schema.minLength) {
+      return `${key} must be at least ${schema.minLength} character(s) long, got: ${JSON.stringify(value)}`;
+    }
+    if (schema.pattern !== undefined && !new RegExp(schema.pattern).test(value)) {
+      return `${key} must match the schema pattern ${JSON.stringify(schema.pattern)}, got: ${JSON.stringify(value)}`;
+    }
+  }
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+      return `${key} must contain at least ${schema.minItems} item(s), got: ${value.length}`;
+    }
+    if (schema.items?.type) {
+      for (const [index, item] of value.entries()) {
+        if (!matchesType(schema.items.type, item)) {
+          return `${key}[${index}] must be ${TYPE_ARTICLE[schema.items.type]}, got: ${jsonTypeOf(item)}`;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Validate a tool call's arguments against the schema the tool advertises in
+ * tools/list. Returns null when the call is acceptable, or a message naming
+ * the offending argument. The schema literal is the only source of truth:
+ * `type`, `enum`, `minimum`, `maximum`, `minLength`, `minItems`,
+ * `items.type`, `pattern`, `required` and `additionalProperties: false` are
+ * all honoured here, and a violation is reported before anything is spawned.
+ */
+function validateArgs(schema: Schema, args: Args): string | null {
+  const properties = schema.properties ?? {};
+  for (const key of schema.required ?? []) {
+    if (args[key] === undefined) {
+      return `missing required argument: ${key}`;
+    }
+  }
+  if (schema.additionalProperties === false) {
+    for (const key of Object.keys(args)) {
+      // Object.hasOwn, not `in`: an argument named "constructor" or
+      // "__proto__" is not a property of the schema.
+      if (!Object.hasOwn(properties, key)) {
+        return `unknown argument: ${key} (not part of this tool's input schema)`;
+      }
+    }
+  }
+  for (const key of Object.keys(args)) {
+    const property = Object.hasOwn(properties, key) ? properties[key] : undefined;
+    if (!property) continue;
+    const message = validateProperty(key, property, args[key]);
+    if (message) return message;
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Typed accesses over loose tool-call arguments
@@ -198,8 +342,9 @@ function intArg(args: Args, key: string, min: number, max: number): number | und
 /**
  * Resolve the effort the runner must use (audit B1/B2/B3):
  *
- * - an explicit effort must be one of the levels the available models accept
- *   (low|medium|high) - anything else is rejected locally;
+ * - the effort LEVEL is validated by the schema validator (the tool's
+ *   advertised enum is the single source of truth), so it is one of
+ *   low|medium|high by the time it reaches this function;
  * - a model id that already carries a tier conflicts with a *different*
  *   effort (the agy CLI hard-fails on that combination), so it is rejected
  *   locally too, before anything is spawned;
@@ -219,19 +364,14 @@ function intArg(args: Args, key: string, min: number, max: number): number | und
  */
 function resolveEffort(
   model: string | undefined,
-  requested: string | undefined,
+  requested: EffortLevel | undefined,
   preset: TaskOptions["effort"]
 ): EffortLevel | undefined {
   const tier = modelTier(model);
-  if (requested !== undefined) {
-    if (!isEffortLevel(requested)) {
-      throw new Error(`effort must be one of ${EFFORT_LEVELS.join("|")}, got: ${requested}`);
-    }
-    if (tier && tier.toLowerCase() !== requested.toLowerCase()) {
-      throw new Error(
-        `model "${model}" already carries tier "${tier}" which conflicts with effort "${requested}"; pass one or the other`
-      );
-    }
+  if (requested !== undefined && tier && tier.toLowerCase() !== requested.toLowerCase()) {
+    throw new Error(
+      `model "${model}" already carries tier "${tier}" which conflicts with effort "${requested}"; pass one or the other`
+    );
   }
   // A tier-carrying model id carries its tier: never add --effort next to it.
   if (tier) return undefined;
@@ -245,16 +385,19 @@ function toOptions(
 ): TaskOptions {
   const model = stringArg(args, "model");
   return {
-    // Runner-level validation reports honest error results for bad calls; the
-    // schema literals above are advisory for clients only.
+    // The advertised schema is enforced before a call reaches this point
+    // (validateArgs), so every value read here is already of the type the
+    // schema declares - the accessors below never silently drop one.
     prompt: stringArg(args, "prompt") as string,
     cwd: stringArg(args, "cwd"),
     conversationId: stringArg(args, "conversation_id"),
     agent: stringArg(args, "agent"),
     model,
-    // Local effort resolution: an unsupported level or a model/effort conflict
-    // throws here, so nothing is spawned for a call the CLI would reject.
-    effort: resolveEffort(model, stringArg(args, "effort"), presets?.effort),
+    // Local effort resolution: a model/effort conflict throws here, so
+    // nothing is spawned for a call the CLI would reject. The effort LEVEL
+    // itself is checked by the schema validator (its enum is the single
+    // source of truth for the "effort must be one of ..." message).
+    effort: resolveEffort(model, stringArg(args, "effort") as EffortLevel | undefined, presets?.effort),
     // No `mode` argument: each tool's preset is fixed by its registration so a
     // read-only explore_task cannot be weakened at call time.
     mode: presets?.mode,
@@ -451,21 +594,24 @@ async function runDelegation(
   signal?: AbortSignal
 ): Promise<ToolResult> {
   const token = progressTokenArg(params);
+  let opts: TaskOptions;
+  try {
+    // The advertised input schema is enforced BEFORE anything is spawned: a
+    // call that does not match it is refused with the same {"error": ...}
+    // envelope the runner's own validation errors use, with isError set -
+    // not as a bare message.
+    const invalid = validateArgs(DELEGATION_INPUT_SCHEMA, args);
+    if (invalid) throw new Error(invalid);
+    opts = toOptions(args, opencodeSessionID(params), presets);
+  } catch (err) {
+    return textResult({ error: (err as Error).message }, true);
+  }
+  // The progress bridge is wired only for an accepted call: a refused one
+  // must not emit a single progress notification.
   const bridge = token === undefined ? null : progressBridgeFor(token);
   if (bridge) {
     // Visible in the server log: the client opted into progress for this call.
     process.stderr.write(`[${SERVER_NAME}] progress bridge active (token=${String(token)})\n`);
-  }
-  let opts: TaskOptions;
-  try {
-    // Local validation (effort level, model/effort conflict) runs before
-    // anything is spawned: a rejected call must reach the client as the same
-    // {"error": ...} envelope the runner's own validation errors use, with
-    // isError set - not as a bare message.
-    opts = toOptions(args, opencodeSessionID(params), presets);
-  } catch (err) {
-    bridge?.finish();
-    return textResult({ error: (err as Error).message }, true);
   }
   if (signal) opts.signal = signal;
 
@@ -624,6 +770,10 @@ const TOOLS: ToolSpec[] = [
     inputSchema: WATCH_INPUT_SCHEMA,
     handler: async (args) => {
       try {
+        // The advertised input schema is enforced here, before the watch
+        // touches the state dir: a refused call never reads a transcript.
+        const invalid = validateArgs(WATCH_INPUT_SCHEMA, args);
+        if (invalid) throw new Error(invalid);
         const streamFile = stringArg(args, "stream_file");
         const tailLines = intArg(args, "tail_lines", 0, 2000);
         const cancel = boolArg(args, "cancel") ?? false;
@@ -676,9 +826,17 @@ const TOOLS: ToolSpec[] = [
     title: "List available agy models",
     description: "List model IDs usable for the `model` parameter of delegation tools.",
     inputSchema: EMPTY_INPUT_SCHEMA,
-    handler: async () => {
-      const { stdout } = await runCmd(AGY_BIN, ["models"], 30_000);
-      return textResult({ models: stdout || "(no output from `agy models`)" });
+    handler: async (args) => {
+      try {
+        // The advertised input schema is enforced here too: the list tools
+        // take no arguments, so any key is an unknown argument.
+        const invalid = validateArgs(EMPTY_INPUT_SCHEMA, args);
+        if (invalid) throw new Error(invalid);
+        const { stdout } = await runCmd(AGY_BIN, ["models"], 30_000);
+        return textResult({ models: stdout || "(no output from `agy models`)" });
+      } catch (err) {
+        return textResult({ error: (err as Error).message }, true);
+      }
     },
   },
   {
@@ -686,11 +844,17 @@ const TOOLS: ToolSpec[] = [
     title: "List available agy agents",
     description: "List agent profiles usable for the `agent` parameter of delegation tools.",
     inputSchema: EMPTY_INPUT_SCHEMA,
-    handler: async () => {
-      const { stdout } = await runCmd(AGY_BIN, ["agents"], 30_000);
-      return textResult({
-        agents: stdout || "(no custom agents configured; default agent will be used)",
-      });
+    handler: async (args) => {
+      try {
+        const invalid = validateArgs(EMPTY_INPUT_SCHEMA, args);
+        if (invalid) throw new Error(invalid);
+        const { stdout } = await runCmd(AGY_BIN, ["agents"], 30_000);
+        return textResult({
+          agents: stdout || "(no custom agents configured; default agent will be used)",
+        });
+      } catch (err) {
+        return textResult({ error: (err as Error).message }, true);
+      }
     },
   },
 ];
