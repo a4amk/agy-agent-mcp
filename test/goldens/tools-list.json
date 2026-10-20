@@ -11,7 +11,8 @@
             "prompt": {
               "type": "string",
               "minLength": 1,
-              "description": "Full, self-contained task description for the sub-agent. Include all needed context and file paths."
+              "pattern": "\\S",
+              "description": "Full, self-contained task description for the sub-agent. Include all needed context and file paths. Must not be empty or whitespace only."
             },
             "conversation_id": {
               "type": "string",
@@ -96,7 +97,8 @@
             "prompt": {
               "type": "string",
               "minLength": 1,
-              "description": "Full, self-contained task description for the sub-agent. Include all needed context and file paths."
+              "pattern": "\\S",
+              "description": "Full, self-contained task description for the sub-agent. Include all needed context and file paths. Must not be empty or whitespace only."
             },
             "conversation_id": {
               "type": "string",
@@ -208,7 +210,8 @@
         "inputSchema": {
           "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",
-          "properties": {}
+          "properties": {},
+          "additionalProperties": false
         },
         "execution": {
           "taskSupport": "forbidden"
@@ -221,7 +224,8 @@
         "inputSchema": {
           "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",
-          "properties": {}
+          "properties": {},
+          "additionalProperties": false
         },
         "execution": {
           "taskSupport": "forbidden"

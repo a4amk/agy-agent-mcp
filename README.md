@@ -49,6 +49,8 @@ Mode is pinned per tool (`accept-edits` for `general_task`, `plan` for `explore_
 
 Model IDs come in two shapes: a bare ID (`gemini-3.8-flash`) that takes its tier from `effort`, and a tier-carrying ID (`gemini-3.8-flash-high`, as returned by `list_models`) that already encodes it. A tier-carrying ID wins over `effort`: no `--effort` flag is passed for it, and combining it with a *different* effort is refused locally (the `agy` CLI rejects that combination outright).
 
+Call arguments are validated against the schema the server advertises in `tools/list`, before anything is spawned: a missing, empty, or whitespace-only `prompt`, a wrong-typed or out-of-range argument (`timeout_ms` `0..3600000`, `tail_lines` `0..2000`, `effort` `low|medium|high`), and an unknown argument key are all refused with the usual `{"error": "..."}` envelope (`isError: true`), and the message names the offending argument. A refused call starts no task, writes no transcript, and releases the single-flight lock.
+
 ## Watching a run live
 
 Every delegation mirrors live CLI events to `<AGY_MCP_STATE_DIR>/task_<id>.stream` (default `/tmp/agy-agent-mcp/tasks/task_<id>.stream`, also returned as `stream_file`). Tail that file directly (`tail -f /tmp/agy-agent-mcp/tasks/task_<id>.stream`) or call `watch_task` with no arguments from another session to view the latest run.

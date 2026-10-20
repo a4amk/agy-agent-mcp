@@ -64,6 +64,15 @@ GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci`, `npm run lint`, and `
 
 ## Behavioral reference
 
+### Input validation (the advertised schema is enforced)
+
+- The hand-written `inputSchema` literal of each tool in `src/index.ts` is the **single source of truth**: the validator (`validateArgs`) reads that literal, it never re-declares a rule in a second place. Honoured keywords: `type`, `enum`, `minimum`, `maximum`, `minLength`, `minItems`, `items.type`, `pattern`, `required`, and `additionalProperties: false`.
+- All five tools validate their arguments: the two delegation tools, `watch_task`, and the two list tools (which take none, so any key is an unknown argument).
+- A refused call returns the house envelope - a single `{"error": "..."}` key with `isError: true` - and the message **names the offending argument** (`missing required argument: prompt`, `prompt must be a string, got: number`, `timeout_ms must be <= 3600000, got: 999999999`, `unknown argument: totally_bogus ...`). It is produced through the same code path as the runner's own `cwd` / `edit_scope` refusals.
+- A refused call spawns nothing: no `agy` process, no `.stream` / `.ndjson` transcript, no progress notification, and the single-flight lock is released.
+- `prompt` must be a non-empty, non-whitespace string (`minLength: 1` plus the `pattern: "\\S"` in the schema). The accepted ranges are otherwise unchanged: `timeout_ms` `0..3600000`, `tail_lines` `0..2000`, `effort` `low|medium|high`, `edit_scope` `minItems: 1`.
+- The `effort must be one of low|medium|high, got: ...` message is produced by exactly one place - the validator, from the schema's `enum` - and its text is unchanged.
+
 ### Delegation result fields (`general_task` / `explore_task`)
 
 - `task_id` (`task_<8-hex-chars>`) — names both `<AGY_MCP_STATE_DIR>/<task_id>.ndjson` (`transcript_file`) and `<AGY_MCP_STATE_DIR>/<task_id>.stream` (`stream_file`), and is accepted directly by `watch_task` (`stream_file`).

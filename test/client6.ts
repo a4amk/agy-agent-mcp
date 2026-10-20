@@ -97,6 +97,16 @@
  *       status field, and no result event at all) comes back with isError true
  *       and status "error", and its error text never reads like a clean exit
  *       (no "code 0").
+ * 17. Input validation in the MCP layer: the schema the server advertises in
+ *     tools/list is ENFORCED before anything is spawned.
+ *     - a missing, empty, whitespace-only, null or wrong-typed prompt, a
+ *       wrong-typed / out-of-range argument, and an unknown argument key are
+ *       all refused with the house {"error": ...} envelope (isError true, one
+ *       key) whose message names the offending argument - with ZERO fake-agy
+ *       invocations, no task transcript, and no progress notification;
+ *     - watch_task and the two list tools are validated the same way;
+ *     - a valid call still succeeds afterwards (the single-flight lock was
+ *       released by the refusals) and spawns exactly one agy.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -2958,6 +2968,171 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     "failure surfacing: a failed delegation is flagged isError and carries the CLI's own error message (exit_code separate), a successful one stays isError=false, and a run that failed despite exit 0 is never described as a clean exit: ok"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 17. Input validation: the advertised schema is enforced before anything runs
+// ---------------------------------------------------------------------------
+{
+  // One fake invocation per delegation: an "invoke" marker line followed by
+  // the argv the server actually spawned.
+  const VALIDATE_BODY = [
+    `printf '%s\\n' "invoke" >> "$AGY_FAKE_ARGFILE"`,
+    `printf '%s\\n' "$@" >> "$AGY_FAKE_ARGFILE"`,
+    `printf '%s\\n' '{"event":"init","conversation_id":"validate-c1","init":{"cwd":"/work/validate","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"validate-c1","status":"SUCCESS","response":"validated","duration_seconds":0.2,"num_turns":1}}'`,
+  ].join("\n");
+  const validateBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(validateBin, `#!/bin/sh\n${VALIDATE_BODY}\n`);
+  chmodSync(validateBin, 0o755);
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "agy-validate-"));
+  const argfile = path.join(stateDir, "argv.txt");
+
+  /** How many times the fake agy was really spawned. */
+  const invocations = (): number =>
+    existsSync(argfile)
+      ? readFileSync(argfile, "utf8")
+          .split("\n")
+          .filter((l) => l === "invoke").length
+      : 0;
+
+  let nextId = 300;
+  const { exitCode } = await driveMcpStdio(validateBin, stateDir, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 299, method: "initialize", params: HANDSHAKE("validate-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(299), "initialize response (id 299)");
+
+    /** One tool call over stdio; returns the wire envelope plus its body. */
+    const call = async (name: string, args: Record<string, unknown>, meta?: unknown) => {
+      nextId += 1;
+      const id = nextId;
+      io.send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args, ...(meta ? { _meta: meta } : {}) },
+      });
+      await io.waitUntil(() => !!io.responseFor(id), `response (id ${id})`);
+      const resp = io.responseFor(id);
+      return {
+        isError: resp?.result?.isError === true,
+        body: JSON.parse(contentText(resp, id)) as Record<string, unknown>,
+      };
+    };
+
+    /**
+     * A call that must be refused locally: the house {"error": ...} envelope
+     * (isError true, one key) naming the offending argument, no spawn, and no
+     * raw TypeError in the message.
+     */
+    const expectRefused = async (label: string, name: string, args: Record<string, unknown>, offending: string) => {
+      const before = invocations();
+      // A progress token on the refused call: it must not produce a single
+      // notifications/progress frame.
+      const r = await call(name, args, { progressToken: `tok-${label}` });
+      if (r.isError !== true) {
+        throw new Error(`(17) ${label}: the call must be refused, got ${JSON.stringify(r.body)}`);
+      }
+      if (Object.keys(r.body).join(",") !== "error") {
+        throw new Error(
+          `(17) ${label}: the refusal must use the {"error": ...} envelope, got ${JSON.stringify(r.body)}`
+        );
+      }
+      const msg = String(r.body.error ?? "");
+      if (!msg.includes(offending)) {
+        throw new Error(`(17) ${label}: the message must name "${offending}", got ${msg}`);
+      }
+      if (/Cannot read propert|undefined is not|reading '/.test(msg)) {
+        throw new Error(`(17) ${label}: a raw TypeError must not escape, got ${msg}`);
+      }
+      if (invocations() !== before) {
+        throw new Error(`(17) ${label}: a refused call must spawn nothing (${invocations() - before} invocations)`);
+      }
+    };
+
+    // (a) The prompt: missing, empty, whitespace only, wrong type, null.
+    await expectRefused("missing prompt", "general_task", { cwd: stateDir }, "prompt");
+    await expectRefused("empty prompt", "general_task", { prompt: "", cwd: stateDir }, "prompt");
+    await expectRefused("blank prompt", "general_task", { prompt: "   ", cwd: stateDir }, "prompt");
+    await expectRefused("typed prompt", "general_task", { prompt: 123, cwd: stateDir }, "prompt");
+    await expectRefused("null prompt", "explore_task", { prompt: null, cwd: stateDir }, "prompt");
+
+    // (b) Wrong-typed and out-of-range arguments.
+    await expectRefused(
+      "typed timeout",
+      "general_task",
+      { prompt: "x", cwd: stateDir, timeout_ms: "soon" },
+      "timeout_ms"
+    );
+    await expectRefused(
+      "range timeout",
+      "general_task",
+      { prompt: "x", cwd: stateDir, timeout_ms: 999_999_999 },
+      "timeout_ms"
+    );
+    await expectRefused(
+      "typed boolean",
+      "general_task",
+      { prompt: "x", cwd: stateDir, auto_approve: "true" },
+      "auto_approve"
+    );
+    await expectRefused("typed array", "general_task", { prompt: "x", cwd: stateDir, add_dirs: [1, 2] }, "add_dirs");
+    await expectRefused(
+      "empty edit scope",
+      "general_task",
+      { prompt: "x", cwd: stateDir, edit_scope: [] },
+      "edit_scope"
+    );
+    await expectRefused("typed effort", "general_task", { prompt: "x", cwd: stateDir, effort: 5 }, "effort");
+
+    // (c) An unknown argument key: a typo must be visible, not ignored.
+    await expectRefused(
+      "unknown key",
+      "general_task",
+      { prompt: "x", cwd: stateDir, totally_bogus: 1 },
+      "totally_bogus"
+    );
+    await expectRefused("unknown mode", "general_task", { prompt: "x", cwd: stateDir, mode: "plan" }, "mode");
+
+    // (d) watch_task and the two list tools are validated the same way.
+    await expectRefused("watch tail", "watch_task", { tail_lines: "abc" }, "tail_lines");
+    await expectRefused("watch unknown", "watch_task", { nope: 1 }, "nope");
+    await expectRefused("list_models unknown", "list_models", { anything: 1 }, "anything");
+    await expectRefused("list_agents unknown", "list_agents", { anything: 1 }, "anything");
+
+    // Not one refused call produced a progress notification.
+    const progress = io.parsed().filter((p) => p.method === "notifications/progress");
+    if (progress.length !== 0) {
+      throw new Error(`(17) a refused call must emit no notifications/progress, got ${JSON.stringify(progress)}`);
+    }
+
+    // (e) A valid call still succeeds - the refusals released the lock.
+    const before = invocations();
+    const ok = await call("general_task", { prompt: "a valid prompt", cwd: stateDir, timeout_ms: 0 });
+    if (ok.isError || ok.body.status !== "success") {
+      throw new Error(`(17) a valid call must still succeed, got ${JSON.stringify(ok.body)}`);
+    }
+    if (invocations() - before !== 1) {
+      throw new Error(`(17) a valid call must spawn exactly one agy, got ${invocations() - before}`);
+    }
+  });
+  if (exitCode !== 0) {
+    throw new Error(`validation suite must exit 0, got ${exitCode}`);
+  }
+
+  // The refused calls left no task behind: exactly one transcript exists.
+  const stateFiles = readdirSync(stateDir);
+  const streams = stateFiles.filter((f) => f.endsWith(".stream"));
+  const transcripts = stateFiles.filter((f) => f.endsWith(".ndjson"));
+  if (streams.length !== 1 || transcripts.length !== 1) {
+    throw new Error(
+      `(17) the refused calls must not create a task transcript, state dir has ${streams.length} .stream and ${transcripts.length} .ndjson files`
+    );
+  }
+
+  console.log(
+    'input validation: missing/empty/blank/typed prompt, typed+out-of-range arguments, unknown keys and watch/list tools refused with the {"error": ...} envelope naming the argument (0 spawns, no transcript, no progress); a valid call still succeeds: ok'
   );
 }
 
