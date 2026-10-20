@@ -1,3 +1,5 @@
 node_modules/
 .agy-mcp/
 *.log
+dist/
+*.tgz

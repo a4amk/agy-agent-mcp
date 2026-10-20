@@ -2,8 +2,11 @@
  * agy-agent-mcp: MCP server exposing the Google Antigravity (`agy`) CLI as
  * subagent-style delegation tools.
  *
- * Run: `node src/index.ts` (stdio transport, zero build step on Node >= 22.6).
+ * Run: `npm run build` then `node dist/index.js` (bin/mcp.mjs wraps this;
+ * npm installs need compiled JavaScript — Node won't type-strip under
+ * node_modules).
  */
+import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -23,7 +26,10 @@ import {
 } from "./agy.ts";
 
 const SERVER_NAME = "agy-agent-mcp";
-const SERVER_VERSION = "0.1.0";
+// Single source of truth: package.json (always present next to dist/ or src/).
+const { version: SERVER_VERSION } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+  version: string;
+};
 
 const server = new McpServer({
   name: SERVER_NAME,

@@ -16,8 +16,12 @@
  * 4. Git-based audit (`captureFilesBefore` / `auditTaskFiles`) and
  *    `resolveEditScope` boundary checks.
  * 5. Startup sweep removes stale `.ndjson` and `.stream` logs only.
+ * 6. Installed-artifact boot: `bin/mcp.mjs` -> dist build answers a real MCP
+ *    handshake (npm installs must ship compiled JS — Node refuses to
+ *    type-strip files under node_modules), and the MCP-advertised version
+ *    matches package.json.
  */
-import { execFile, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   closeSync,
@@ -858,6 +862,76 @@ if (latestWatched.found !== true || latestWatched.file !== fNew || latestWatched
   throw new Error(`watchTask with no streamFile must pick latest by mtime: ${JSON.stringify(latestWatched)}`);
 }
 console.log("readStreamTail (tail_lines, charLimit clip, running/finished detection) + watchTask: ok");
+
+// ---------------------------------------------------------------------------
+// 6. Installed artifact boots: bin shim -> dist build over a real MCP handshake
+// ---------------------------------------------------------------------------
+console.log("boot smoke (bin -> dist after pretest build): starting");
+const pkgTest = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")) as { version: string };
+
+{
+  const noOpBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(noOpBin, "#!/bin/sh\nexit 0\n");
+  chmodSync(noOpBin, 0o755);
+
+  const child = spawn(process.execPath, ["bin/mcp.mjs"], {
+    cwd: ROOT,
+    env: { ...process.env, AGY_BIN: noOpBin },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lines: string[] = [];
+  let stderrText = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (d: string) => lines.push(...d.split("\n").filter(Boolean)));
+  child.stderr.on("data", (d: string) => {
+    stderrText += d;
+  });
+
+  const send = (m: unknown) => child.stdin.write(`${JSON.stringify(m)}\n`);
+  send({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "boot-smoke", version: "0" } },
+  });
+  send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+
+  const deadline = Date.now() + 10_000;
+  while (!lines.some((l) => l.includes('"id":2')) && Date.now() < deadline) await sleep(100);
+  child.kill("SIGTERM");
+  await new Promise((r) => child.on("exit", r));
+
+  if (!stderrText.includes("[agy-agent-mcp] starting") || !stderrText.includes("connected on stdio")) {
+    throw new Error(`bin shim must boot dist with the startup banner: ${JSON.stringify(stderrText.slice(0, 200))}`);
+  }
+  const parsed = lines.map((l) => JSON.parse(l) as { id?: number; result?: Record<string, unknown> });
+  const hello = parsed.find((j) => j.id === 1)?.result as
+    | { serverInfo?: { name?: string; version?: string }; protocolVersion?: string }
+    | undefined;
+  if (hello?.serverInfo?.name !== "agy-agent-mcp") {
+    throw new Error(`dist server must answer initialize with serverInfo: ${JSON.stringify(hello)}`);
+  }
+  if (hello.protocolVersion !== "2025-06-18") {
+    throw new Error(`dist server must echo the client protocolVersion: ${hello.protocolVersion}`);
+  }
+  if (hello.serverInfo.version !== pkgTest.version) {
+    throw new Error(`serverInfo.version ${hello.serverInfo.version} must match package.json ${pkgTest.version}`);
+  }
+  const listed = parsed.find((j) => j.id === 2)?.result as
+    | { tools?: Array<{ name: string; inputSchema?: { type?: string } }> }
+    | undefined;
+  const want = new Set(["general_task", "explore_task", "watch_task", "list_models", "list_agents"]);
+  const got = new Set((listed?.tools ?? []).map((t) => t.name));
+  if (got.size !== want.size || [...want].some((n) => !got.has(n))) {
+    throw new Error(`tools/list from dist must expose all 5 tools: ${[...got].join(", ")}`);
+  }
+  if ((listed?.tools ?? []).some((t) => t.inputSchema?.type !== "object")) {
+    throw new Error("every tools/list entry must carry an object inputSchema");
+  }
+  console.log("boot smoke (bin -> dist handshake, version single-sourced, 5 tools): ok");
+}
 
 closeSync(0);
 console.log("=== OFFLINE TESTS PASS ===");
