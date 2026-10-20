@@ -43,6 +43,14 @@
  *     == done line in the last message and written before the result
  *     envelope); without a token the wire behavior stays exactly today's
  *     (zero notifications/progress).
+ * 11. Live-follow companion CLI (`dist/follow.js` over the fake-agy harness):
+ *     the success run exits 0 with >=2 mirrored fake stream lines before the
+ *     `=== task done ===` marker, the JSON after the marker parses to a
+ *     success TaskResult, stderr carries exactly the `[agy-agent-follow]`
+ *     banner, `--model` reaches agy as an adjacent pair with NO `--effort`
+ *     argument anywhere, mirrored lines match the on-disk .stream transcript,
+ *     and stdout outside the framing/stream/result block is whitespace-only;
+ *     the failure path exits 1 with a non-success status.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -1597,6 +1605,185 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     `progress bridge: ${noteCount} token-gated notifications (>=3 pre-result, progress strictly increasing from 0, fragments mirrored from .stream, == done last & ahead of the envelope); tokenless delegation emits 0: ok`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 11. Live-follow companion CLI: dist/follow.js delegates runTask directly
+// ---------------------------------------------------------------------------
+{
+  // Deterministic stream fixtures (no sleeps -> the mirrored lines are exactly
+  // these): quick SUCCESS for the live-mirror/argv probes, nonzero-exit ERROR
+  // for the failure path. Both capture argv via the same argCap mechanism the
+  // argv-envelope sections use.
+  const QUICK_BODY = [
+    argCap,
+    `printf '%s\\n' '{"event":"init","conversation_id":"follow-c1","init":{"cwd":"/work/follow","tools":["read_file"],"permission_mode":"plan"}}'`,
+    `printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"follow-c1","step_index":0,"state":"DONE","step_type":"user_input"}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"follow-c1","status":"SUCCESS","response":"done quickly","duration_seconds":1.2,"num_turns":1}}'`,
+  ].join("\n");
+  const FAIL_BODY = [
+    argCap,
+    `printf '%s\\n' '{"event":"init","conversation_id":"follow-f1","init":{"cwd":"/work/fail","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"follow-f1","status":"ERROR","response":"exploded","duration_seconds":0.9,"num_turns":1}}'`,
+    "exit 2",
+  ].join("\n");
+  const quickFollowBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  const failFollowBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(quickFollowBin, `#!/bin/sh\n${QUICK_BODY}\n`);
+  writeFileSync(failFollowBin, `#!/bin/sh\n${FAIL_BODY}\n`);
+  chmodSync(quickFollowBin, 0o755);
+  chmodSync(failFollowBin, 0o755);
+
+  console.log("follow CLI: starting");
+  const MARKER = "\n=== task done ===\n";
+
+  /** Spawn dist/follow.js over one state dir, collect full stdio, wait for exit. */
+  async function spawnFollow(
+    stateDir: string,
+    agyBin: string,
+    args: string[]
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    const argfile = path.join(stateDir, "argv.txt");
+    return await new Promise((resolve) => {
+      const child = spawn(process.execPath, ["dist/follow.js", ...args], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          AGY_BIN: agyBin,
+          AGY_MCP_STATE_DIR: stateDir,
+          AGY_FAKE_ARGFILE: argfile,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdoutText = "";
+      let stderrText = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (d: string) => {
+        stdoutText += d;
+      });
+      child.stderr.on("data", (d: string) => {
+        stderrText += d;
+      });
+      const killer = setTimeout(() => child.kill("SIGKILL"), 20_000);
+      killer.unref?.();
+      child.on("exit", (code) => {
+        clearTimeout(killer);
+        resolve({ code: code ?? -999, stdout: stdoutText, stderr: stderrText });
+      });
+    });
+  }
+
+  // (a) Success run — exit 0, live mirror before the marker, result JSON after.
+  const okDir = mkdtempSync(path.join(os.tmpdir(), "agy-follow-"));
+  const ok = await spawnFollow(okDir, quickFollowBin, [
+    "--model",
+    "gemini-3.8-flash-medium",
+    "--cwd",
+    okDir,
+    "watch",
+    "this",
+    "delegation",
+    "live",
+  ]);
+  if (ok.code !== 0) {
+    throw new Error(`(11) follow success run must exit 0, got ${ok.code}\nstdout: ${ok.stdout}\nstderr: ${ok.stderr}`);
+  }
+
+  // stderr: exactly the single meta banner, nothing else.
+  const okStderr = ok.stderr.split("\n").filter((l) => l.trim() !== "");
+  const okBanner = `[agy-agent-follow] tool=general model=gemini-3.8-flash-medium cwd=${okDir}`;
+  if (okStderr.join("\n") !== okBanner) {
+    throw new Error(`(11) stderr must be exactly the meta banner, got: ${JSON.stringify(ok.stderr)}`);
+  }
+
+  // stdout framing: split at the marker; JSON result after it.
+  const markerIdx = ok.stdout.indexOf(MARKER);
+  if (markerIdx < 0) {
+    throw new Error(`(11) stdout must contain the "=== task done ===" marker: ${JSON.stringify(ok.stdout)}`);
+  }
+  const front = ok.stdout.slice(0, markerIdx);
+  const after = ok.stdout.slice(markerIdx + MARKER.length);
+  const followed = JSON.parse(after) as { status?: string; task_id?: string; stream_file?: string };
+  if (followed.status !== "success" || typeof followed.task_id !== "string") {
+    throw new Error(`(11) result JSON after the marker must be a success TaskResult: ${after}`);
+  }
+
+  // Pre-marker stdout = the single --- task banner + the fake's mirrored
+  // stream lines, and NOTHING else non-whitespace (stdout purity: the meta
+  // banner went to stderr).
+  const frontLines = front.split("\n");
+  const taskStart = frontLines.filter((l) => l.startsWith("--- task "));
+  const mirrored = frontLines.filter((l) => l.trim() !== "" && !l.startsWith("--- task "));
+  const wantMirror = [
+    "session open · cwd=/work/follow · permission_mode=plan · tools=1",
+    "● user_input",
+    "== done: status=SUCCESS · 1.2s",
+  ];
+  if (mirrored.length < 2 || JSON.stringify(mirrored) !== JSON.stringify(wantMirror)) {
+    throw new Error(
+      `(11) pre-marker stdout must be only the mirrored stream lines (>= 2), got: ${JSON.stringify(mirrored)}`
+    );
+  }
+  if (
+    taskStart.length !== 1 ||
+    !/^--- task task_[0-9a-f]{8} · stream task_[0-9a-f]{8}\.stream ---$/.test(taskStart[0] as string)
+  ) {
+    throw new Error(
+      `(11) --- task banner must name the in-flight task id + stream basename: ${JSON.stringify(taskStart)}`
+    );
+  }
+  // Every mirrored line must also have reached the on-disk .stream transcript
+  // the result names (bridge hook fires only after a successful file append).
+  const okStream = readFileSync(followed.stream_file as string, "utf8");
+  for (const line of mirrored) {
+    if (!okStream.includes(line)) {
+      throw new Error(`(11) mirrored line missing from the on-disk .stream transcript: ${JSON.stringify(line)}`);
+    }
+  }
+
+  // (c) Model/effort flag discipline: --model reaches agy as an adjacent pair;
+  // no --effort argument at all (the agy CLI rejects it next to a tiered id).
+  const argvFollow = readArgv(path.join(okDir, "argv.txt"));
+  const modelPos = argvFollow.indexOf("--model");
+  if (modelPos < 0 || argvFollow[modelPos + 1] !== "gemini-3.8-flash-medium") {
+    throw new Error(`(11) --model must reach agy as an adjacent pair, argv: ${argvFollow.join(" ")}`);
+  }
+  if (argvFollow.includes("--effort")) {
+    throw new Error(`(11) follow must never pass --effort (model ID carries its tier), argv: ${argvFollow.join(" ")}`);
+  }
+
+  // (b) Failure path: non-success CLI result -> exit 1 and non-success status.
+  const badDir = mkdtempSync(path.join(os.tmpdir(), "agy-fail-"));
+  const bad = await spawnFollow(badDir, failFollowBin, ["--cwd", badDir, "probe", "the", "failure", "path"]);
+  if (bad.code !== 1) {
+    throw new Error(
+      `(11) follow must exit 1 on a non-success run, got ${bad.code}\nstdout: ${bad.stdout}\nstderr: ${bad.stderr}`
+    );
+  }
+  const badBanner = `[agy-agent-follow] tool=general model=default cwd=${badDir}`;
+  if (
+    bad.stderr
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .join("\n") !== badBanner
+  ) {
+    throw new Error(`(11) failure-run stderr must be exactly the meta banner, got: ${JSON.stringify(bad.stderr)}`);
+  }
+  const badIdx = bad.stdout.indexOf(MARKER);
+  if (badIdx < 0) {
+    throw new Error(`(11) failure-run stdout must contain the result marker: ${JSON.stringify(bad.stdout)}`);
+  }
+  const badResult = JSON.parse(bad.stdout.slice(badIdx + MARKER.length)) as { status?: string };
+  if (badResult.status === "success" || typeof badResult.status !== "string") {
+    throw new Error(
+      `(11) failure-run result must carry a non-success status: ${bad.stdout.slice(badIdx + MARKER.length)}`
+    );
+  }
+
+  console.log(
+    `follow CLI: success exit ${ok.code}/failure exit ${bad.code}, ${mirrored.length} mirrored stream lines pre-marker + parsed result JSON after, stderr banner-only, --model pair without --effort, stdout pure: ok`
   );
 }
 

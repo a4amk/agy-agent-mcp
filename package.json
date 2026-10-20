@@ -5,7 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "agy-agent-mcp": "bin/mcp.mjs"
+    "agy-agent-mcp": "bin/mcp.mjs",
+    "agy-agent-follow": "bin/follow.mjs"
   },
   "files": [
     "dist",
