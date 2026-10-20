@@ -1,0 +1,8 @@
+stub:
+AGY_BIN stub output (test fixture stub-agy):
+cached: no models found
+agi gemini claude
+
+server stderr:
+[agy-agent-mcp] starting (agy=/tmp/opencode/stub-agy, idle_timeout_ms=900000, wall_timeout_ms=off, auto_approve=allowed, retention=7d)
+[agy-agent-mcp] connected on stdio

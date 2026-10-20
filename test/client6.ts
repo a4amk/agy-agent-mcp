@@ -16,10 +16,21 @@
  * 4. Git-based audit (`captureFilesBefore` / `auditTaskFiles`) and
  *    `resolveEditScope` boundary checks.
  * 5. Startup sweep removes stale `.ndjson` and `.stream` logs only.
- * 6. Installed-artifact boot: `bin/mcp.mjs` -> dist build answers a real MCP
+ * 6. `watch_task` helpers and installed-artifact boot: `listStreamFiles` /
+ *    `readStreamTail`, then `bin/mcp.mjs` -> dist build answers a real MCP
  *    handshake (npm installs must ship compiled JS — Node refuses to
  *    type-strip files under node_modules), and the MCP-advertised version
  *    matches package.json.
+ * 7. Protocol parity over stdio: the whole `test/goldens/` capture scenario
+ *    replayed step-by-step against `bin/mcp.mjs` (stub AGY_BIN) — every
+ *    response deep-equals its golden file (initialize serverInfo.version
+ *    checked against package.json), garbage lines and notifications stay
+ *    silent, duplicate initialize is answered, the boot banner is exact, and
+ *    stdin EOF exits cleanly.
+ * 8. Zero runtime dependencies: package.json has no (empty) dependencies
+ *    field, src/index.ts imports neither the MCP SDK nor zod, and a
+ *    production `npm install` of the package materializes neither
+ *    `@modelcontextprotocol` nor `zod`.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -931,6 +942,240 @@ const pkgTest = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")
     throw new Error("every tools/list entry must carry an object inputSchema");
   }
   console.log("boot smoke (bin -> dist handshake, version single-sourced, 5 tools): ok");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Protocol parity over stdio: the entire test/goldens scenario replayed
+// ---------------------------------------------------------------------------
+console.log("protocol parity vs test/goldens (bin -> dist): starting");
+{
+  const stubAgy = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  // Print exactly the two lines the goldens were captured against.
+  writeFileSync(stubAgy, `#!/bin/sh\necho "cached: no models found"\necho "agi / gemini / claude"\n`);
+  chmodSync(stubAgy, 0o755);
+
+  const child = spawn(process.execPath, ["bin/mcp.mjs"], {
+    cwd: ROOT,
+    env: { ...process.env, AGY_BIN: stubAgy },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const chunks: string[] = [];
+  let stderrText = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (d: string) => chunks.push(d));
+  child.stderr.on("data", (d: string) => {
+    stderrText += d;
+  });
+
+  const linesSoFar = () =>
+    chunks
+      .join("")
+      .split("\n")
+      .filter((l) => l.trim() !== "");
+
+  type JsonRpcResponse = {
+    id?: string | number;
+    result?: Record<string, unknown>;
+    error?: { code: number; message: string };
+  };
+
+  // Paced step: one message, wait for the response with the expected id (or
+  // assert silence for garbage lines / notifications — id null).
+  async function step(message: unknown, wantId: number | null): Promise<JsonRpcResponse | null> {
+    const before = linesSoFar().length;
+    child.stdin.write(`${typeof message === "string" ? message : JSON.stringify(message)}\n`);
+    if (wantId === null) {
+      await sleep(120);
+      const now = linesSoFar();
+      if (now.length !== before) {
+        child.kill("SIGKILL");
+        throw new Error(`garbage line / notification must never produce a response, got: ${now[before]}`);
+      }
+      return null;
+    }
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const now = linesSoFar();
+      if (now.length > before) {
+        const resp = JSON.parse(now[before]) as JsonRpcResponse;
+        if (resp.id !== wantId) {
+          child.kill("SIGKILL");
+          throw new Error(`out-of-order response: wanted id ${wantId}, got line ${now[before]}`);
+        }
+        return resp;
+      }
+      if (Date.now() > deadline) {
+        child.kill("SIGKILL");
+        throw new Error(`timed out waiting for response id ${wantId}`);
+      }
+      await sleep(10);
+    }
+  }
+
+  // Exact boot banner (stderr), then wait for the connect line before driving.
+  const connectDeadline = Date.now() + 10_000;
+  while (!stderrText.includes("connected on stdio") && Date.now() < connectDeadline) await sleep(10);
+  const stderrLines = stderrText.split("\n").filter((l) => l.trim() !== "");
+  const banner = `[agy-agent-mcp] starting (agy=${stubAgy}, idle_timeout_ms=${runner.DEFAULT_IDLE_TIMEOUT_MS === 0 ? "off" : runner.DEFAULT_IDLE_TIMEOUT_MS}, wall_timeout_ms=${runner.DEFAULT_PRINT_TIMEOUT_MS === 0 ? "off" : runner.DEFAULT_PRINT_TIMEOUT_MS}, auto_approve=${runner.ALLOW_AUTO_APPROVE ? "allowed" : "denied"}${runner.ROOT ? `, root=${runner.ROOT}` : ""}, retention=${runner.RETENTION_DAYS === 0 ? "off" : `${runner.RETENTION_DAYS}d`})`;
+  if (stderrLines[0] !== banner) {
+    child.kill("SIGKILL");
+    throw new Error(`boot banner mismatch:\n  got:    ${stderrLines[0] ?? "(none)"}\n  wanted: ${banner}`);
+  }
+  if (stderrLines[1] !== "[agy-agent-mcp] connected on stdio") {
+    child.kill("SIGKILL");
+    throw new Error(`missing "connected on stdio" line: ${stderrLines[1] ?? "(none)"}`);
+  }
+  if (stderrLines.length !== 2) {
+    child.kill("SIGKILL");
+    throw new Error(`stderr must carry exactly the two boot lines, got ${stderrLines.length}: ${stderrText}`);
+  }
+
+  // Structural deep-equal over parsed JSON (key-order independent).
+  function jsonDeepEqual(a: unknown, b: unknown): boolean {
+    if (a === b) return true;
+    if (typeof a !== "object" || a === null || typeof b !== "object" || b === null) return a === b;
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    const ka = Object.keys(a as Record<string, unknown>);
+    const kb = Object.keys(b as Record<string, unknown>);
+    if (ka.length !== kb.length) return false;
+    return ka.every(
+      (k) =>
+        k in (b as Record<string, unknown>) &&
+        jsonDeepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])
+    );
+  }
+
+  const INIT_PARAMS = {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "capture", version: "0" },
+  };
+  const scenario: Array<{ send: unknown; id: number | null; golden: string | null }> = [
+    { send: { jsonrpc: "2.0", id: 99, method: "resources/list", params: {} }, id: 99, golden: "premature-request" },
+    { send: "this is not json at all", id: null, golden: null },
+    { send: { jsonrpc: "2.0", id: 1, method: "initialize", params: INIT_PARAMS }, id: 1, golden: "initialize" },
+    { send: { jsonrpc: "2.0", method: "notifications/initialized" }, id: null, golden: null },
+    {
+      send: { jsonrpc: "2.0", id: 21, method: "initialize", params: INIT_PARAMS },
+      id: 21,
+      golden: "duplicate-initialize",
+    },
+    { send: { jsonrpc: "2.0", id: 7, method: "ping" }, id: 7, golden: "ping" },
+    {
+      send: { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "list_models", arguments: {} } },
+      id: 4,
+      golden: "tool-call-list-models",
+    },
+    {
+      send: { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "list_agents", arguments: {} } },
+      id: 5,
+      golden: "tool-call-list-agents",
+    },
+    {
+      send: { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "nope", arguments: {} } },
+      id: 6,
+      golden: "tool-call-unknown-tool",
+    },
+    {
+      send: { jsonrpc: "2.0", id: 12, method: "tools/call", params: { arguments: {} } },
+      id: 12,
+      golden: "tool-call-missing-name",
+    },
+    { send: { jsonrpc: "2.0", id: 9, method: "bogus/method" }, id: 9, golden: "method-not-found" },
+    { send: { jsonrpc: "2.0", method: "notifications/cancelled", params: {} }, id: null, golden: null },
+    { send: { jsonrpc: "2.0", id: 2, method: "tools/list" }, id: 2, golden: "tools-list" },
+  ];
+
+  let responses = 0;
+  for (const s of scenario) {
+    const resp = await step(s.send, s.id);
+    if (s.golden === null) continue;
+    responses++;
+    const golden = JSON.parse(
+      readFileSync(path.join(ROOT, "test", "goldens", `${s.golden}.json`), "utf8")
+    ) as JsonRpcResponse;
+    if (s.golden === "initialize" || s.golden === "duplicate-initialize") {
+      const gotInfo = (resp?.result as { serverInfo?: { version?: string } } | undefined)?.serverInfo;
+      const goldenInfo = (golden.result as { serverInfo?: { version?: string } }).serverInfo;
+      if (gotInfo?.version !== pkgTest.version) {
+        throw new Error(`initialize serverInfo.version ${gotInfo?.version} must match package.json ${pkgTest.version}`);
+      }
+      // Everything except the version must equal the golden exactly.
+      delete gotInfo?.version;
+      delete goldenInfo?.version;
+    }
+    if (!jsonDeepEqual(resp, golden)) {
+      throw new Error(
+        `response for ${s.golden} deviates from the golden:\n  got:    ${JSON.stringify(resp)}\n  golden: ${JSON.stringify(golden)}`
+      );
+    }
+  }
+
+  // EOF: the server exits gracefully and every request got exactly one line.
+  child.stdin.end();
+  const exitCode = await new Promise<number>((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve(-999);
+    }, 10_000);
+    child.on("exit", (c) => {
+      clearTimeout(timer);
+      resolve(c ?? -999);
+    });
+  });
+  const all = linesSoFar();
+  if (all.length !== 10) {
+    throw new Error(`expected exactly 10 response lines (garbage + notifications silent), got ${all.length}`);
+  }
+  if (exitCode !== 0) {
+    throw new Error(`stdin EOF must end the server cleanly with exit 0, got ${exitCode}`);
+  }
+
+  console.log(
+    `protocol parity vs test/goldens: 10/10 golden-deep-equal (${responses} matched), 0 stray lines, banner exact, EOF exit 0: ok`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Zero runtime dependencies: package.json, server source, production install
+// ---------------------------------------------------------------------------
+{
+  const pkgFull = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
+    dependencies?: Record<string, string>;
+  };
+  const deps = pkgFull.dependencies ?? {};
+  if (Object.keys(deps).length !== 0) {
+    throw new Error(`package.json must carry zero runtime dependencies, got: ${JSON.stringify(deps)}`);
+  }
+  const serverSrc = readFileSync(path.join(ROOT, "src", "index.ts"), "utf8");
+  if (serverSrc.includes("modelcontextprotocol")) {
+    throw new Error("src/index.ts must not reference the MCP SDK anywhere");
+  }
+  if (serverSrc.includes(' from "zod"')) {
+    throw new Error('src/index.ts must not import from "zod"');
+  }
+  // What a consumer install materializes: re-install the package manifest
+  // without devDependencies — nothing need appear under node_modules, least of
+  // all the withdrawn runtime deps.
+  const probe = mkdtempSync(path.join(os.tmpdir(), "agy-prod-install-"));
+  writeFileSync(path.join(probe, "package.json"), JSON.stringify(pkgFull, null, 2));
+  const npm = spawnSync(
+    "npm",
+    ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=error"],
+    { cwd: probe, encoding: "utf8", timeout: 120_000 }
+  );
+  if (npm.status !== 0) {
+    throw new Error(`production install probe failed (exit ${npm.status}): ${npm.stderr}`);
+  }
+  for (const gone of ["@modelcontextprotocol", "zod"]) {
+    if (existsSync(path.join(probe, "node_modules", gone))) {
+      throw new Error(`production install must not materialize node_modules/${gone} (zero runtime deps)`);
+    }
+  }
+  console.log(
+    "zero runtime deps: no dependencies field, src/index.ts free of SDK/zod, production install brings no @modelcontextprotocol/zod: ok"
+  );
 }
 
 closeSync(0);

@@ -1,7 +1,7 @@
 {
   "name": "agy-agent-mcp",
-  "version": "0.1.2",
-  "description": "MCP server for subagent-style task delegation to the Antigravity (agy) CLI: headless runs, live stream transcripts, git-audited file scope. Works with OpenCode, Claude Code, and any MCP client.",
+  "version": "0.2.0",
+  "description": "Zero-dependency MCP server for subagent-style task delegation to the Antigravity (agy) CLI: headless runs, live stream transcripts, git-audited file scope. Works with OpenCode, Claude Code, and any MCP client.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -48,12 +48,9 @@
   "engines": {
     "node": ">=22.6"
   },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.1",
-    "zod": "^3.25.76"
-  },
   "devDependencies": {
     "@biomejs/biome": "^2.5.15",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@types/node": "^26.6.5",
     "typescript": "^5.9.3"
   }

@@ -50,7 +50,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci`, `npm run lint`, and `
 
 - Target the `main` branch and keep pull requests focused on a single change.
 - Use concise, one-line commit messages.
-- When adding or modifying delegation tools (`general_task`, `explore_task`), inspection tools (`watch_task`), or discovery tools (`list_models`, `list_agents`), register them in `src/index.ts` using the shared delegation factory and option schema fragments.
+- When adding or modifying delegation tools (`general_task`, `explore_task`), inspection tools (`watch_task`), or discovery tools (`list_models`, `list_agents`), add an entry to the five-tool table in `src/index.ts` (title, description, hand-written `inputSchema` literal, and handler); the `test/goldens/` files capture the exact wire shape and must stay in deep agreement.
 - Make sure `npm run lint` and `npm test` pass cleanly before opening a pull request (and `node test/client.ts` when changing live CLI integration).
 
 ## Behavioral reference

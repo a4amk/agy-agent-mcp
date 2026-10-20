@@ -4,6 +4,8 @@
 
 An MCP server that wraps the [Antigravity](https://antigravity.google) CLI (`agy`) as five subagent tools (`general_task`, `explore_task`, `watch_task`, `list_models`, and `list_agents`). Every delegated task is a single headless CLI run (`agy -p "<prompt>" --output-format stream-json`), and **the tool call is the wait** — the call blocks until the child process exits and returns the final report in one shot. While the run is in flight, its work streams live to a human-readable `.stream` transcript on disk.
 
+The server has **zero runtime dependencies** — the small stdio MCP protocol slice it needs is hand-implemented in `src/index.ts`, so `npm install` ships no transitive packages.
+
 ## Install
 
 Requires Node >= 22.6 and an authenticated `agy` CLI.

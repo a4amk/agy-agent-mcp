@@ -1,0 +1,226 @@
+{
+  "result": {
+    "tools": [
+      {
+        "name": "general_task",
+        "title": "Run general-purpose Antigravity sub-agent task",
+        "description": "Delegate a general-purpose coding task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Defaults: mode accept-edits, effort medium. The result carries the agent's final response, the resumable conversation_id, token usage, denied_actions, and the git-based files_touched/scope_violations audit when cwd is a git repo. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. File edits inside the task cwd never prompt; set edit_scope so out-of-scope changes are flagged in the audit. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Full, self-contained task description for the sub-agent. Include all needed context and file paths."
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Existing agy conversation ID to continue/resume instead of starting a new conversation. Returned by previous task results."
+            },
+            "cwd": {
+              "type": "string",
+              "description": "Working directory for the delegated task (project the sub-agent operates on). Defaults to the server's cwd."
+            },
+            "model": {
+              "type": "string",
+              "description": "Model for the task, e.g. gemini-3.8-flash-medium, claude-opus-5-5-high (see list_models)"
+            },
+            "agent": {
+              "type": "string",
+              "description": "Antigravity agent profile to use (see list_agents)"
+            },
+            "effort": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "description": "Reasoning effort for the task"
+            },
+            "auto_approve": {
+              "type": "boolean",
+              "description": "Expert switch: pass --dangerously-skip-permissions so headless runs stop auto-denying gated tools. Pair it with sandbox when granting it. Allowed by this server."
+            },
+            "sandbox": {
+              "type": "boolean",
+              "description": "Run the task with Antigravity's terminal sandbox flag enabled (--sandbox)"
+            },
+            "add_dirs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Extra directories to add to the task's workspace (--add-dir, repeatable)"
+            },
+            "edit_scope": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "description": "Give the sub-agent an edit boundary (files and directories relative to cwd, or absolute). Out-of-scope changes are surfaced in the result's files_touched/scope_violations audit; it is an audit-and-replay control, not a sandbox — the CLI writes files itself."
+            },
+            "project": {
+              "type": "string",
+              "description": "Antigravity project ID or name for the task"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3600000,
+              "description": "Idle timeout for the run in ms (0..3600000; 0 disables the idle kill for this run). Resets on every stdout/stderr chunk from the child; kicks in after this much child silence and kills the child (SIGTERM, then SIGKILL after 5s). Default: 900000 (AGY_MCP_IDLE_TIMEOUT_MS)."
+            }
+          },
+          "required": [
+            "prompt"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "explore_task",
+        "title": "Run read-only Antigravity exploration task",
+        "description": "Delegate a fast read-only exploration and diagnosis task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Defaults: mode plan (read-only), effort low; the mode preset is fixed, so callers cannot weaken the read-only posture. Produces answers and summaries without modifying files. Returns the same report as general_task, including the git-based files_touched/scope_violations audit. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Full, self-contained task description for the sub-agent. Include all needed context and file paths."
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Existing agy conversation ID to continue/resume instead of starting a new conversation. Returned by previous task results."
+            },
+            "cwd": {
+              "type": "string",
+              "description": "Working directory for the delegated task (project the sub-agent operates on). Defaults to the server's cwd."
+            },
+            "model": {
+              "type": "string",
+              "description": "Model for the task, e.g. gemini-3.8-flash-medium, claude-opus-5-5-high (see list_models)"
+            },
+            "agent": {
+              "type": "string",
+              "description": "Antigravity agent profile to use (see list_agents)"
+            },
+            "effort": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "description": "Reasoning effort for the task"
+            },
+            "auto_approve": {
+              "type": "boolean",
+              "description": "Expert switch: pass --dangerously-skip-permissions so headless runs stop auto-denying gated tools. Pair it with sandbox when granting it. Allowed by this server."
+            },
+            "sandbox": {
+              "type": "boolean",
+              "description": "Run the task with Antigravity's terminal sandbox flag enabled (--sandbox)"
+            },
+            "add_dirs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Extra directories to add to the task's workspace (--add-dir, repeatable)"
+            },
+            "edit_scope": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "description": "Give the sub-agent an edit boundary (files and directories relative to cwd, or absolute). Out-of-scope changes are surfaced in the result's files_touched/scope_violations audit; it is an audit-and-replay control, not a sandbox — the CLI writes files itself."
+            },
+            "project": {
+              "type": "string",
+              "description": "Antigravity project ID or name for the task"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3600000,
+              "description": "Idle timeout for the run in ms (0..3600000; 0 disables the idle kill for this run). Resets on every stdout/stderr chunk from the child; kicks in after this much child silence and kills the child (SIGTERM, then SIGKILL after 5s). Default: 900000 (AGY_MCP_IDLE_TIMEOUT_MS)."
+            }
+          },
+          "required": [
+            "prompt"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "watch_task",
+        "title": "Watch live or recent task stream transcript",
+        "description": "Tails a task's live stream transcript. No args = latest run. Call it while a general_task/explore_task is in flight (this or any session) to watch the sub-agent work; the returned 'running' field plus 'modified' tell a live run from an abandoned one.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "stream_file": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Stream transcript to read. Omit for the latest task_<id>.stream in AGY_MCP_STATE_DIR. Accepted forms: an absolute path under AGY_MCP_STATE_DIR, a bare file name like \"task_f8870173.stream\", or a task id like \"task_f8870173\" / \"f8870173\"."
+            },
+            "tail_lines": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2000,
+              "description": "Number of trailing lines to return (1..2000, default 400; 0 returns the full transcript, hard-capped at 200,000 chars)."
+            }
+          },
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "list_models",
+        "title": "List available agy models",
+        "description": "List model IDs usable for the `model` parameter of delegation tools.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {}
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "list_agents",
+        "title": "List available agy agents",
+        "description": "List agent profiles usable for the `agent` parameter of delegation tools.",
+        "inputSchema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {}
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      }
+    ]
+  },
+  "jsonrpc": "2.0",
+  "id": 2
+}

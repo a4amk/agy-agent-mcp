@@ -1,0 +1,13 @@
+{
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"models\": \"cached: no models found\\nagi / gemini / claude\"\n}"
+      }
+    ],
+    "isError": false
+  },
+  "jsonrpc": "2.0",
+  "id": 4
+}
