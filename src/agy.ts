@@ -1062,6 +1062,11 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
       : undefined;
 
   const cliStatus = typeof json?.status === "string" ? (json.status as string).trim().toUpperCase() : "";
+  // The CLI's own error message (it rides along in the result event) is the most
+  // specific explanation of a failure - it is surfaced verbatim instead of
+  // being replaced by a generic process-level message. The process exit code
+  // stays in the separate exit_code field.
+  const cliError = typeof json?.error === "string" && json.error.trim() !== "" ? (json.error as string) : undefined;
   const rawResponse = typeof json?.response === "string" ? (json.response as string) : "";
   const truncated = rawResponse.length > MAX_RESPONSE_CHARS;
 
@@ -1083,8 +1088,33 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
     status = "success";
   } else {
     status = "error";
-    const what = outcome.exitCode === null ? `signal ${outcome.exitSignal ?? "unknown"}` : `code ${outcome.exitCode}`;
-    error = `agy exited with ${what}${json ? "" : " (no JSON result line in output)"}`;
+    if (cliError) {
+      // Verbatim: the CLI's own words about what went wrong. The process exit
+      // code is reported separately (exit_code), never merged into this text.
+      error = cliError;
+    } else if (outcome.exitCode === 0) {
+      // The process exited 0, but this run is a failure - it must never be
+      // described as a clean exit ("code 0"). Say what is missing instead.
+      if (cliStatus) {
+        // The CLI reported a non-SUCCESS status but the process exited 0.
+        error = `agy reported status ${cliStatus} and exited 0`;
+      } else if (json) {
+        // A result event arrived but it carried no usable status.
+        error = "agy exited 0 without reporting a result status (the run failed)";
+      } else {
+        // No result event at all.
+        error = "agy exited 0 without producing a result event (the run failed; no JSON result line in output)";
+      }
+    } else {
+      const what = outcome.exitCode === null ? `signal ${outcome.exitSignal ?? "unknown"}` : `code ${outcome.exitCode}`;
+      error = `agy exited with ${what}${json ? "" : " (no JSON result line in output)"}`;
+    }
+  }
+  // A CLI error message that arrives together with a server-side cause (a
+  // kill, a cancellation) is appended, never dropped: it is the most specific
+  // account of what the CLI was doing when the run ended.
+  if (cliError && error && status !== "success" && error !== cliError) {
+    error = `${error} (agy reported: ${cliError})`;
   }
 
   const result: TaskResult = {

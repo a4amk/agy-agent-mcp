@@ -533,6 +533,8 @@ async function runDelegation(
         });
 
       if (started.receipt) {
+        // A background handle is not a failure: it says "running", so it must
+        // not be flagged as an error.
         return textResult(started.receipt);
       }
       const result = await runPromise;
@@ -554,7 +556,10 @@ async function runDelegation(
     // streamed, so "the server streamed but the client showed nothing" is
     // distinguishable from "the client never opted in".
     if (bridge) result.progress_bridge = bridge.stats();
-    return textResult(result);
+    // A failed delegation is a failed tool call: the envelope says so, so an
+    // orchestrating agent that keys off isError does not read a failed run as
+    // a success. The background path above already reports it the same way.
+    return textResult(result, result.status !== "success");
   } catch (err) {
     return textResult({ error: (err as Error).message }, true);
   } finally {

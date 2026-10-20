@@ -97,6 +97,7 @@ npx agy-agent-follow --model gemini-3.8-flash --effort high "summarize the open 
 ## Delegating
 
 - **The call is the wait**: `general_task` and `explore_task` block until the headless `agy` process exits and return the structured report (`response`, `status`, `duration_seconds`, `usage`, `denied_actions`, `files_touched`, `stream_file`, `transcript_file`).
+- **Failures are failures**: a run that did not succeed comes back with `isError: true` on the tool result and `status` `"error"`, `"timeout"` or `"quota_error"`. `error` carries the CLI's own failure message (verbatim) when it reported one, `exit_code` carries the process exit code, and `notes` keeps the CLI's non-JSON stdout plus stderr. A failed run is never described as a clean exit: the server never writes `code 0` into `error` (the CLI's own message is surfaced verbatim even when it says so itself).
 - **Resumable conversations**: each result includes a `conversation_id` UUID when reported by the CLI; pass it back on a subsequent `general_task` or `explore_task` call to continue the thread.
 - **Per-call overrides**: pass optional `model`, `agent`, `effort`, `cwd`, `add_dirs`, `project`, `sandbox`, or `auto_approve` (`--dangerously-skip-permissions`, pair with `sandbox`) on any task call.
 - **Effort defaults**: without an explicit `effort`, `general_task` runs at `medium` and `explore_task` at `low`; a tier-carrying model ID (as returned by `list_models`) overrides that default, because its tier is already part of the ID.

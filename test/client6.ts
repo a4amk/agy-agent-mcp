@@ -9,7 +9,8 @@
  *    - stdout noise + stream-json result: stream events mirror to `.stream`
  *      and stay out of notes, the result event's inner object wins, plain-text
  *      lines plus stderr land in notes;
- *    - malformed output (stream with no result event) -> status error;
+ *    - malformed output (stream with no result event, non-zero exit) -> status
+ *      error;
  *      exit 3 + 429 noise + result event -> quota_error;
  *    - timeout: SIGTERM kill, `timeout` event in the ndjson log, no zombie.
  * 3. `runTask` rejects bad cwd / escaping edit_scope before anything spawns.
@@ -84,6 +85,18 @@
  *       case-insensitively): a case-variant tier id is refused locally on a
  *       conflicting effort (zero invocations) and suppresses --effort
  *       otherwise.
+ * 16. Failure surfacing in the MCP layer (driven over stdio against a fake agy):
+ *     - a failed delegation (the CLI reports status ERROR with its own error
+ *       message and exits 3) comes back with isError true, status "error" and
+ *       the CLI's error message verbatim in body.error, while the process exit
+ *       code stays in the separate exit_code field and the stderr noise stays
+ *       in notes;
+ *     - a successful delegation comes back with isError false, status
+ *       "success" and no error field;
+ *     - a run that failed although the process exited 0 (a result event with no
+ *       status field, and no result event at all) comes back with isError true
+ *       and status "error", and its error text never reads like a clean exit
+ *       (no "code 0").
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -537,6 +550,9 @@ for (const want of ["task_start", "spawn", "exit", "task_end"]) {
 console.log("streaming fixture: result unwrap, stream file mirroring, malformed-line containment, notes clean: ok");
 
 // 2e. Malformed output: stream transcript with no result event -> honest error + notes kept.
+// The fake exits non-zero here, so the error names the exit code ("agy exited with code 1").
+// The zero-exit twin of this scenario (a run that fails although the process exited 0, which
+// must NOT be described as a clean exit) is covered in section 16.
 const runBad = await fakeRun(
   [
     argCap,
@@ -544,7 +560,7 @@ const runBad = await fakeRun(
     `printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"bad-c1","step_index":0,"state":"DONE","step_type":"user_input"}}'`,
     'echo "something went wrong during boot"',
     'echo "{not json"',
-    "exit 0",
+    "exit 1",
   ].join("\n"),
   { prompt: "prove stream without result event is surfaced as error", cwd: ws }
 );
@@ -2810,6 +2826,138 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     "effort & model resolution: general_task --effort medium, explore_task --effort low, tier-carrying id suppresses --effort, conflicting/unsupported/off-enum efforts refused locally with 0 invocations, case-variant tier ids detected: ok"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 16. Failure surfacing in the MCP layer: isError + the CLI's own error message
+// ---------------------------------------------------------------------------
+{
+  /** A fake whose CLI reports a failure with a machine-readable error, then exits 3. */
+  const FAIL_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"fail-c1","init":{"cwd":"/work/fail","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"fail-c1","status":"ERROR","response":"","error":"boom: something went wrong","duration_seconds":0.3,"num_turns":1}}'`,
+    `echo "fake agy stderr noise" >&2`,
+    "exit 3",
+  ].join("\n");
+  /** The same fake, but the run succeeds. */
+  const OK_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"ok-c1","init":{"cwd":"/work/ok","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"ok-c1","status":"SUCCESS","response":"all good","duration_seconds":0.3,"num_turns":1}}'`,
+  ].join("\n");
+  /** A result event with NO status field at all; the process exits 0. */
+  const NO_STATUS_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"nostatus-c1","init":{"cwd":"/work/nostatus","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"nostatus-c1","response":"","duration_seconds":0.3,"num_turns":1}}'`,
+    "exit 0",
+  ].join("\n");
+  /** No result event at all; the process exits 0. */
+  const NO_RESULT_BODY = [`echo "fake agy produced nothing" >&2`, "exit 0"].join("\n");
+  const writeFake = (body: string): string => {
+    const bin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+    writeFileSync(bin, `#!/bin/sh\n${body}\n`);
+    chmodSync(bin, 0o755);
+    return bin;
+  };
+
+  /** One general_task over stdio; returns the wire envelope plus its parsed body. */
+  const delegate = async (bin: string, stateDir: string, id: number) => {
+    const captured: { isError: boolean; body: Record<string, unknown> } = { isError: false, body: {} };
+    const { exitCode } = await driveMcpStdio(bin, stateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: id - 1, method: "initialize", params: HANDSHAKE("fail-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(id - 1), `initialize response (id ${id - 1})`);
+      io.send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "failure surfacing probe", cwd: stateDir } },
+      });
+      await io.waitUntil(() => !!io.responseFor(id), `tools/call response (id ${id})`);
+      const resp = io.responseFor(id);
+      captured.isError = resp?.result?.isError === true;
+      captured.body = JSON.parse(contentText(resp, id)) as Record<string, unknown>;
+    });
+    if (exitCode !== 0) {
+      throw new Error(`failure-surfacing suite must exit 0, got ${exitCode}`);
+    }
+    return captured;
+  };
+
+  // (a) A failed delegation: the tool envelope is flagged AND the CLI's own
+  //     error message reaches the caller (not just the exit code).
+  const failStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-failsurf-"));
+  const failed = await delegate(writeFake(FAIL_BODY), failStateDir, 302);
+  if (failed.isError !== true) {
+    throw new Error(`(16a) a failed delegation must be flagged isError: ${JSON.stringify(failed.body)}`);
+  }
+  if (failed.body.status !== "error") {
+    throw new Error(`(16a) a failed delegation must report status=error: ${JSON.stringify(failed.body)}`);
+  }
+  if (failed.body.error !== "boom: something went wrong") {
+    throw new Error(`(16a) the CLI's error message must be surfaced verbatim: ${JSON.stringify(failed.body.error)}`);
+  }
+  if (failed.body.exit_code !== 3) {
+    throw new Error(`(16a) the exit code must stay in exit_code: ${JSON.stringify(failed.body)}`);
+  }
+  if (!String(failed.body.notes ?? "").includes("fake agy stderr noise")) {
+    throw new Error(`(16a) the stderr noise must stay in notes: ${JSON.stringify(failed.body.notes)}`);
+  }
+
+  // (b) A successful delegation is NOT flagged as an error.
+  const okStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-failsurf-ok-"));
+  const ok = await delegate(writeFake(OK_BODY), okStateDir, 304);
+  if (ok.isError !== false) {
+    throw new Error(`(16b) a successful delegation must not be flagged isError: ${JSON.stringify(ok.body)}`);
+  }
+  if (ok.body.status !== "success") {
+    throw new Error(`(16b) a successful delegation must report status=success: ${JSON.stringify(ok.body)}`);
+  }
+  if (ok.body.error !== undefined) {
+    throw new Error(`(16b) a successful delegation must not carry an error: ${JSON.stringify(ok.body)}`);
+  }
+
+  // (c) A result event with NO status field, process exit 0: the run failed, so
+  //     the error must not read like a clean exit ("code 0").
+  const noStatusStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-failsurf-nostatus-"));
+  const noStatus = await delegate(writeFake(NO_STATUS_BODY), noStatusStateDir, 306);
+  if (noStatus.isError !== true) {
+    throw new Error(`(16c) a status-less failed delegation must be flagged isError: ${JSON.stringify(noStatus.body)}`);
+  }
+  if (noStatus.body.status !== "error") {
+    throw new Error(`(16c) a status-less failed delegation must report status=error: ${JSON.stringify(noStatus.body)}`);
+  }
+  const noStatusErr = String(noStatus.body.error ?? "");
+  if (noStatusErr.length === 0 || /code 0/.test(noStatusErr)) {
+    throw new Error(`(16c) a failed run must never be described as a clean exit: ${JSON.stringify(noStatusErr)}`);
+  }
+  if (!/status/i.test(noStatusErr)) {
+    throw new Error(`(16c) the error must name the missing result status: ${JSON.stringify(noStatusErr)}`);
+  }
+
+  // (d) No result event at all, process exit 0: same rule, and the missing
+  //     JSON result line stays named.
+  const noResultStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-failsurf-noresult-"));
+  const noResult = await delegate(writeFake(NO_RESULT_BODY), noResultStateDir, 308);
+  if (noResult.isError !== true) {
+    throw new Error(`(16d) a result-less failed delegation must be flagged isError: ${JSON.stringify(noResult.body)}`);
+  }
+  if (noResult.body.status !== "error") {
+    throw new Error(`(16d) a result-less failed delegation must report status=error: ${JSON.stringify(noResult.body)}`);
+  }
+  const noResultErr = String(noResult.body.error ?? "");
+  if (noResultErr.length === 0 || /code 0/.test(noResultErr)) {
+    throw new Error(`(16d) a failed run must never be described as a clean exit: ${JSON.stringify(noResultErr)}`);
+  }
+  if (!noResultErr.includes("no JSON result line in output")) {
+    throw new Error(`(16d) the error must name the missing JSON result line: ${JSON.stringify(noResultErr)}`);
+  }
+  if (!String(noResult.body.notes ?? "").includes("fake agy produced nothing")) {
+    throw new Error(`(16d) the stderr noise must stay in notes: ${JSON.stringify(noResult.body.notes)}`);
+  }
+
+  console.log(
+    "failure surfacing: a failed delegation is flagged isError and carries the CLI's own error message (exit_code separate), a successful one stays isError=false, and a run that failed despite exit 0 is never described as a clean exit: ok"
   );
 }
 
