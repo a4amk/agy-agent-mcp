@@ -55,7 +55,7 @@ interface ToolSpec {
   title: string;
   description: string;
   inputSchema: InputSchema;
-  handler: (args: Args, params: Args) => Promise<ToolResult>;
+  handler: (args: Args, params: Args, signal?: AbortSignal) => Promise<ToolResult>;
 }
 
 const DELEGATION_INPUT_SCHEMA: InputSchema = {
@@ -79,7 +79,8 @@ const DELEGATION_INPUT_SCHEMA: InputSchema = {
     },
     model: {
       type: "string",
-      description: "Model for the task, e.g. gemini-3.8-flash-medium, claude-opus-5-5-high (see list_models)",
+      description:
+        "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field) or a tier-carrying id such as gemini-3.8-flash-high (see list_models). Never combine a tier-carrying id with a different effort - the agy CLI rejects that combination.",
     },
     agent: {
       type: "string",
@@ -233,7 +234,13 @@ const DELEGATION_TOOLS = new Set(["general_task", "explore_task"]);
  * blocked. taskId/streamPath are filled by the runner's onTaskStart hook so a
  * rejection can point at the live run before anything streams.
  */
-let activeDelegation: { tool: string; taskId?: string; streamPath?: string } | null = null;
+let activeDelegation: {
+  tool: string;
+  requestId: JsonRpcId;
+  taskId?: string;
+  streamPath?: string;
+  abort?: () => void;
+} | null = null;
 
 /** House tool-error envelope naming the in-flight run (or the tool if it has not reported a task yet). */
 function delegationRejectedResult(): ToolResult {
@@ -363,11 +370,13 @@ function progressBridgeFor(token: string | number) {
 async function runDelegation(
   args: Args,
   params: Args,
-  presets: { mode?: TaskOptions["mode"]; effort?: TaskOptions["effort"] }
+  presets: { mode?: TaskOptions["mode"]; effort?: TaskOptions["effort"] },
+  signal?: AbortSignal
 ): Promise<ToolResult> {
   const token = progressTokenArg(params);
   const bridge = token === undefined ? null : progressBridgeFor(token);
   const opts = toOptions(args, opencodeSessionID(params), presets);
+  if (signal) opts.signal = signal;
   // Always wired, token or no token: the single-flight lock needs the
   // in-flight taskId/streamPath the instant the run starts — before any line
   // streams — so its rejection message can name them. With a token the bridge
@@ -412,7 +421,8 @@ const TOOLS: ToolSpec[] = [
       "edit_scope so out-of-scope changes are flagged in the audit. auto_approve is the expert full-auto switch " +
       "(--dangerously-skip-permissions); pair it with sandbox when granting it.",
     inputSchema: DELEGATION_INPUT_SCHEMA,
-    handler: async (args, params) => runDelegation(args, params, { mode: "accept-edits", effort: "medium" }),
+    handler: async (args, params, signal) =>
+      runDelegation(args, params, { mode: "accept-edits", effort: "medium" }, signal),
   },
   {
     name: "explore_task",
@@ -428,7 +438,7 @@ const TOOLS: ToolSpec[] = [
       "server never edits. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair " +
       "it with sandbox when granting it.",
     inputSchema: DELEGATION_INPUT_SCHEMA,
-    handler: async (args, params) => runDelegation(args, params, { mode: "plan", effort: "low" }),
+    handler: async (args, params, signal) => runDelegation(args, params, { mode: "plan", effort: "low" }, signal),
   },
   {
     name: "watch_task",
@@ -535,14 +545,20 @@ function toolsCall(params: Args, id: JsonRpcId): void | Promise<void> {
   // general_task/explore_task is rejected immediately (not queued), while
   // watch_task / list_models / list_agents / ping never touch it.
   const isDelegation = DELEGATION_TOOLS.has(name);
+  let abortController: AbortController | undefined;
   if (isDelegation) {
     if (activeDelegation !== null) {
       return respond(id, delegationRejectedResult());
     }
-    activeDelegation = { tool: name };
+    abortController = new AbortController();
+    activeDelegation = {
+      tool: name,
+      requestId: id,
+      abort: () => abortController?.abort(),
+    };
   }
   return tool
-    .handler(asObject(params.arguments), params)
+    .handler(asObject(params.arguments), params, abortController?.signal)
     .then(
       (result) => respond(id, result),
       // Tool handlers catch their own runner errors; this arm is the defensive
@@ -556,7 +572,9 @@ function toolsCall(params: Args, id: JsonRpcId): void | Promise<void> {
     )
     .finally(() => {
       // Released in finally so timeout kills and run errors release it too.
-      if (isDelegation) activeDelegation = null;
+      if (isDelegation && activeDelegation?.requestId === id) {
+        activeDelegation = null;
+      }
     });
 }
 
@@ -603,6 +621,25 @@ function handleMessage(line: string): void {
   if (msg.jsonrpc !== "2.0") return; // not envelope-shaped: ignored
   if ("result" in msg || "error" in msg) return; // a stray client-side response: nothing to do
   if (typeof msg.method !== "string") return; // not a request/notification: ignored
+
+  if (msg.method === "notifications/cancelled") {
+    const cancelParams = asObject(msg.params);
+    const reqId = cancelParams.requestId;
+    if (
+      (typeof reqId === "string" || (typeof reqId === "number" && Number.isInteger(reqId))) &&
+      activeDelegation !== null &&
+      activeDelegation.requestId === reqId
+    ) {
+      try {
+        activeDelegation.abort?.();
+      } catch {
+        /* abort callback error swallowed */
+      }
+      activeDelegation = null;
+    }
+    return;
+  }
+
   const { id } = msg;
   // Requests carry a string or integer id; everything else (no id, null,
   // fractional) is a notification — answered never, even unknown methods.
@@ -645,12 +682,16 @@ function ignoreStdinError(): void {}
 process.stdin.on("error", ignoreStdinError);
 // EOF ends the server gracefully: the client is gone, kill in-flight headless
 // run children the same way SIGINT/SIGTERM do below, then exit cleanly.
-function shutdownAndExit(): void {
-  shutdownRunner();
+async function shutdownAndExit(): Promise<void> {
+  await shutdownRunner();
   process.exit(0);
 }
-process.stdin.on("end", shutdownAndExit);
-process.stdin.on("close", shutdownAndExit);
+process.stdin.on("end", () => {
+  void shutdownAndExit();
+});
+process.stdin.on("close", () => {
+  void shutdownAndExit();
+});
 
 process.stderr.write(`[${SERVER_NAME}] connected on stdio\n`);
 
@@ -658,9 +699,9 @@ process.stderr.write(`[${SERVER_NAME}] connected on stdio\n`);
 // writes surface it as an unhandled EPIPE. Exit quietly — in-flight headless
 // run children are killed on the way out; nothing else needs cleanup that the
 // next boot's sweep would not do anyway.
-process.on("uncaughtException", (err) => {
+process.on("uncaughtException", async (err) => {
   if ((err as NodeJS.ErrnoException)?.code === "EPIPE") {
-    shutdownRunner();
+    await shutdownRunner();
     process.exit(1);
   }
   throw err;
@@ -670,8 +711,8 @@ process.on("uncaughtException", (err) => {
 // could attach to anymore, so leaving one running would only orphan model
 // usage in the background — see shutdownRunner.
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
-  process.on(sig, () => {
-    shutdownRunner();
+  process.on(sig, async () => {
+    await shutdownRunner();
     process.exit(0);
   });
 }

@@ -6,10 +6,14 @@
  * forwards the live transcript to stdout, so a delegated run can be watched
  * from a terminal while it happens. stdout carries exactly the mirrored
  * `.stream` transcript lines plus the final result JSON; the single meta
- * banner goes to stderr. Deliberately no `--effort` flag: Antigravity model
- * IDs carry their reasoning tier ("gemini-3.8-flash-medium" is medium), and
- * the agy CLI rejects `--model <tiered-id>` together with a conflicting
- * `--effort` (error: "conflicts with --effort=low").
+ * banner goes to stderr.
+ *
+ * Model and effort are two separate knobs, exactly as on the MCP tool surface:
+ * pass a bare model id together with `--effort` (e.g. `--model
+ * gemini-3.8-flash --effort high`), or a model id that already carries its
+ * tier (e.g. `gemini-3.8-flash-high`) without `--effort`. The agy CLI rejects
+ * a tier-carrying model id together with a *different* `--effort`, so that
+ * mismatch is refused locally before a task is ever spawned.
  */
 import path from "node:path";
 import { runTask, shutdownRunner, type TaskOptions, type TaskResult } from "./agy.ts";
@@ -17,6 +21,12 @@ import { runTask, shutdownRunner, type TaskOptions, type TaskResult } from "./ag
 /** Tool name -> fixed runner mode preset (the same pinning as the MCP tools). */
 const TOOL_MODES = { general: "accept-edits", explore: "plan" } as const;
 type ToolName = keyof typeof TOOL_MODES;
+
+/** Reasoning effort levels the agy CLI accepts for a model. */
+const EFFORT_LEVELS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+
+/** A model id that already carries its tier, e.g. gemini-3.8-flash-high. */
+const MODEL_TIER = /-(low|medium|high|xhigh|max)$/;
 
 const FOLLOW_NAME = "agy-agent-follow";
 
@@ -30,10 +40,11 @@ is 0 only when the result status is "success".
 Options:
   --tool general|explore   Posture to imitate: general -> accept-edits
                            (default), explore -> plan (read-only).
-  --model <model-id>       Model for the task, e.g. gemini-3.8-flash-medium.
-                           Deliberately NO --effort flag: the model ID carries
-                           its tier, and the agy CLI rejects "--model
-                           <tiered-id>" together with a conflicting "--effort".
+  --model <model-id>       Model for the task, e.g. gemini-3.8-flash. Pair it
+                           with --effort to choose the reasoning tier.
+  --effort <level>         Reasoning effort: low|medium|high|xhigh|max. A
+                           model id that already carries a tier (e.g.
+                           gemini-3.8-flash-high) must not repeat it.
   --cwd <dir>              Working directory for the delegated task
                            (default: this process's cwd).
   --timeout-ms <n>         Idle timeout for the run in ms, 0..3600000
@@ -44,6 +55,7 @@ Options:
 interface FollowInvocation {
   tool: ToolName;
   model?: string;
+  effort?: TaskOptions["effort"];
   cwd?: string;
   timeoutMs?: number;
   prompt?: string;
@@ -59,6 +71,18 @@ function parseInvocation(argv: string[]): FollowInvocation {
   while (i < argv.length) {
     const arg = argv[i] as string;
     i += 1;
+    if (arg === "--") {
+      while (i < argv.length) {
+        const word = argv[i] as string;
+        i += 1;
+        parsed.prompt = parsed.prompt === undefined ? word : `${parsed.prompt} ${word}`;
+      }
+      break;
+    }
+    if (parsed.prompt !== undefined) {
+      parsed.prompt = `${parsed.prompt} ${arg}`;
+      continue;
+    }
     const take = (): string | undefined => {
       const value = argv[i];
       i += 1;
@@ -67,7 +91,13 @@ function parseInvocation(argv: string[]): FollowInvocation {
     };
     if (arg === "--help") {
       parsed.help = true;
-    } else if (arg === "--tool" || arg === "--model" || arg === "--cwd" || arg === "--timeout-ms") {
+    } else if (
+      arg === "--tool" ||
+      arg === "--model" ||
+      arg === "--effort" ||
+      arg === "--cwd" ||
+      arg === "--timeout-ms"
+    ) {
       const value = take();
       if (value === undefined) {
         problems.push(`${arg} requires a value`);
@@ -77,6 +107,9 @@ function parseInvocation(argv: string[]): FollowInvocation {
       } else if (arg === "--timeout-ms") {
         if (/^\d+$/.test(value) && Number(value) <= 3_600_000) parsed.timeoutMs = Number(value);
         else problems.push(`--timeout-ms must be an integer in 0..3600000, got: ${value}`);
+      } else if (arg === "--effort") {
+        if (EFFORT_LEVELS.includes(value)) parsed.effort = value as TaskOptions["effort"];
+        else problems.push(`--effort must be one of ${EFFORT_LEVELS.join("|")}, got: ${value}`);
       } else if (arg === "--model") {
         parsed.model = value;
       } else {
@@ -85,8 +118,18 @@ function parseInvocation(argv: string[]): FollowInvocation {
     } else if (arg.startsWith("--")) {
       problems.push(`unknown option: ${arg}`);
     } else {
-      parsed.prompt = parsed.prompt === undefined ? arg : `${parsed.prompt} ${arg}`;
+      parsed.prompt = arg;
     }
+  }
+  // The agy CLI refuses a model id that already carries a tier together with a
+  // different --effort ("invalid model selection ... conflicts"). Catch it
+  // locally so the mismatch is a usage error instead of a spawned-and-failed
+  // run.
+  const modelTier = parsed.model?.match(MODEL_TIER)?.[1];
+  if (modelTier && parsed.effort && modelTier !== parsed.effort) {
+    problems.push(
+      `--model ${parsed.model} already carries tier "${modelTier}" which conflicts with --effort ${parsed.effort}; pass one or the other`
+    );
   }
   if (parsed.prompt === undefined && !parsed.help && problems.length === 0) {
     problems.push("missing prompt");
@@ -108,24 +151,24 @@ const invocation = parseInvocation(process.argv.slice(2));
 // from SIGTERM (143) for scripts.
 // ---------------------------------------------------------------------------
 
-process.on("SIGINT", () => {
-  shutdownRunner();
+process.on("SIGINT", async () => {
+  await shutdownRunner();
   process.exit(130);
 });
-process.on("SIGTERM", () => {
-  shutdownRunner();
+process.on("SIGTERM", async () => {
+  await shutdownRunner();
   process.exit(143);
 });
 
 // A dead consumer turns stdout writes into unhandled EPIPE the same way the
 // MCP server's client death does — exit quietly, killing the in-flight child.
-process.on("uncaughtException", (err) => {
+process.on("uncaughtException", async (err) => {
   if ((err as NodeJS.ErrnoException)?.code === "EPIPE") {
-    shutdownRunner();
-    process.exit(1);
+    await shutdownRunner();
+    process.exit(141);
   }
-  shutdownRunner();
-  throw err;
+  await shutdownRunner();
+  process.exit(1);
 });
 
 // ---------------------------------------------------------------------------
@@ -153,6 +196,7 @@ if (invocation.help) {
     mode: TOOL_MODES[invocation.tool],
   };
   if (invocation.timeoutMs !== undefined) opts.timeoutMs = invocation.timeoutMs;
+  if (invocation.effort !== undefined) opts.effort = invocation.effort;
   opts.onTaskStart = (taskId, streamPath) => {
     process.stdout.write(`--- task ${taskId} · stream ${path.basename(streamPath)} ---\n`);
   };

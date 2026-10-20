@@ -11,8 +11,18 @@
  * allow-rules stay owned by the user in their own settings.json.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  appendFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -87,6 +97,7 @@ export interface TaskOptions {
    */
   onTaskStart?: (taskId: string, streamPath: string) => void;
   onStreamLine?: (text: string) => void;
+  signal?: AbortSignal;
 }
 
 export interface Task {
@@ -98,7 +109,7 @@ export interface Task {
   transcriptFile: string;
   streamFile: string;
   editScope?: string[];
-  filesBefore?: string;
+  filesBefore?: FilesSnapshot;
   opts: TaskOptions;
 }
 
@@ -173,11 +184,58 @@ export function resolveEditScope(cwd: string, entries: string[], root: string | 
 // Git-based change audit (files_touched / scope_violations)
 // ---------------------------------------------------------------------------
 
+/** Bound hashing cost on large files: skip sha256 above 5 MB and fall back to size + mtime. */
+const MAX_HASH_FILE_BYTES = 5 * 1024 * 1024;
+/** Bound sha256 hashing cost on large dirty sets: at most 500 files and 50 MB total sha256 reads. */
+const MAX_HASH_DIRTY_FILES = 500;
+const MAX_TOTAL_HASH_BYTES = 50 * 1024 * 1024;
+
+function hashFileContent(filePath: string, fallbackOnly = false): string | null {
+  try {
+    const st = lstatSync(filePath);
+    if (st.isSymbolicLink()) {
+      const target = readlinkSync(filePath);
+      return `symlink:${target}`;
+    }
+    if (st.isDirectory()) {
+      const gitPath = path.join(filePath, ".git");
+      if (existsSync(gitPath)) {
+        try {
+          const rev = spawnSync("git", ["-C", filePath, "rev-parse", "HEAD"], {
+            encoding: "utf8",
+            timeout: 2_000,
+          });
+          if (rev.status === 0 && rev.stdout.trim()) {
+            return `submodule:${rev.stdout.trim()}`;
+          }
+        } catch {
+          /* fallback to mtime if git rev-parse fails */
+        }
+      }
+      return `dir:${st.mtimeMs}`;
+    }
+    if (!st.isFile()) return null;
+    if (fallbackOnly || st.size > MAX_HASH_FILE_BYTES) {
+      return `fallback:${st.size}:${st.mtimeMs}`;
+    }
+    const buf = readFileSync(filePath);
+    return createHash("sha256").update(buf).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+export interface FilesSnapshot {
+  porcelain: string;
+  hashes: Map<string, string | null>;
+}
+
 /**
- * If `cwd` is inside a git work tree, capture `git status --porcelain` before
- * the task spawns. Returns `null` when `cwd` is not a git repo.
+ * If `cwd` is inside a git work tree, capture `git status --porcelain` and
+ * content hashes for dirty files before the task spawns. Returns `null` when
+ * `cwd` is not a git repo.
  */
-export function captureFilesBefore(cwd: string): string | null {
+export function captureFilesBefore(cwd: string): FilesSnapshot | null {
   try {
     const rev = spawnSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
       encoding: "utf8",
@@ -189,7 +247,32 @@ export function captureFilesBefore(cwd: string): string | null {
       timeout: 5_000,
     });
     if (st.status !== 0) return null;
-    return st.stdout;
+    const porcelain = st.stdout;
+    const dirty = parsePorcelain(porcelain);
+    const hashes = new Map<string, string | null>();
+    let hashedBytes = 0;
+    let fileCount = 0;
+    for (const file of dirty.keys()) {
+      const fullPath = path.resolve(cwd, file);
+      const fallbackOnly = fileCount >= MAX_HASH_DIRTY_FILES || hashedBytes >= MAX_TOTAL_HASH_BYTES;
+      const h = hashFileContent(fullPath, fallbackOnly);
+      hashes.set(file, h);
+      fileCount++;
+      if (
+        h &&
+        !h.startsWith("fallback:") &&
+        !h.startsWith("symlink:") &&
+        !h.startsWith("submodule:") &&
+        !h.startsWith("dir:")
+      ) {
+        try {
+          hashedBytes += statSync(fullPath).size;
+        } catch {
+          /* ignore stat error */
+        }
+      }
+    }
+    return { porcelain, hashes };
   } catch {
     return null;
   }
@@ -202,7 +285,15 @@ function parsePorcelain(raw: string): Map<string, string> {
     const status = line.slice(0, 2);
     let file = line.slice(3).trim();
     const arrow = file.indexOf(" -> ");
-    if (arrow >= 0) file = file.slice(arrow + 4).trim();
+    if (arrow >= 0) {
+      let oldFile = file.slice(0, arrow).trim();
+      let newFile = file.slice(arrow + 4).trim();
+      if (oldFile.startsWith('"') && oldFile.endsWith('"')) oldFile = oldFile.slice(1, -1);
+      if (newFile.startsWith('"') && newFile.endsWith('"')) newFile = newFile.slice(1, -1);
+      if (oldFile) map.set(oldFile, "D ");
+      if (newFile) map.set(newFile, status);
+      continue;
+    }
     if (file.startsWith('"') && file.endsWith('"')) {
       file = file.slice(1, -1);
     }
@@ -212,13 +303,13 @@ function parsePorcelain(raw: string): Map<string, string> {
 }
 
 /**
- * Diff the current `git status --porcelain` against `filesBefore` (the
- * snapshot captured by captureFilesBefore before the task spawned). Returns
- * `undefined` when the task cwd is not a git repo (filesBefore null).
+ * Diff the current `git status --porcelain` and dirty file hashes against
+ * `filesBefore` (the snapshot captured by captureFilesBefore before the task
+ * spawned). Returns `undefined` when the task cwd is not a git repo (filesBefore null).
  */
 export function auditTaskFiles(audit: {
   cwd: string;
-  filesBefore?: string | null;
+  filesBefore?: FilesSnapshot | string | null;
   editScope?: string[];
 }): { files_touched: string[]; scope_violations?: string[] } | undefined {
   // A clean pre-task `git status --porcelain` snapshot is the empty string;
@@ -235,14 +326,41 @@ export function auditTaskFiles(audit: {
   } catch {
     return undefined;
   }
-  const before = parsePorcelain(audit.filesBefore);
+  const beforeRaw = typeof audit.filesBefore === "string" ? audit.filesBefore : audit.filesBefore.porcelain;
+  const beforeHashes =
+    typeof audit.filesBefore === "string" ? new Map<string, string | null>() : audit.filesBefore.hashes;
+  const before = parsePorcelain(beforeRaw);
   const after = parsePorcelain(afterRaw);
   const touched: string[] = [];
+  const seen = new Set<string>();
+
   for (const [file, status] of after.entries()) {
-    if (before.get(file) !== status) {
+    if (!before.has(file)) {
       touched.push(file);
+      seen.add(file);
+    } else {
+      const beforeHash = beforeHashes.get(file);
+      if (beforeHash !== undefined) {
+        const fallbackOnly = beforeHash?.startsWith("fallback:") ?? false;
+        const afterHash = hashFileContent(path.resolve(audit.cwd, file), fallbackOnly);
+        if (beforeHash !== afterHash || before.get(file) !== status) {
+          touched.push(file);
+          seen.add(file);
+        }
+      } else if (before.get(file) !== status) {
+        touched.push(file);
+        seen.add(file);
+      }
     }
   }
+
+  for (const file of before.keys()) {
+    if (!seen.has(file) && !after.has(file)) {
+      touched.push(file);
+      seen.add(file);
+    }
+  }
+
   const result: { files_touched: string[]; scope_violations?: string[] } = {
     files_touched: touched.slice(0, 50),
   };
@@ -645,6 +763,20 @@ export function parseResultLine(
   return collector.finish();
 }
 
+function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): void {
+  const pid = child.pid;
+  if (!pid || pid <= 0) return;
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      /* process already gone */
+    }
+  }
+}
+
 const activeChildren = new Map<ChildProcess, () => void>();
 
 /**
@@ -682,9 +814,28 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
   const idleTimeoutMs = effectiveIdleTimeoutMs(opts);
   const wallTimeoutMs = DEFAULT_PRINT_TIMEOUT_MS;
   const t0 = Date.now();
+
+  if (opts.signal?.aborted) {
+    const error = "task was cancelled before execution started";
+    logEvent(task, { event: "abort", error });
+    return {
+      task_id: task.id,
+      status: "error",
+      auto_approve_applied: task.autoApproveApplied,
+      opencode_session_id: opts.sessionID,
+      prompt: truncate(opts.prompt, 200),
+      cwd,
+      response: "",
+      exit_code: null,
+      error,
+      transcript_file: task.transcriptFile,
+      stream_file: task.streamFile,
+    };
+  }
+
   let child: ChildProcess;
   try {
-    child = spawn(AGY_BIN, args, { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    child = spawn(AGY_BIN, args, { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"], detached: true });
   } catch (err) {
     const error = `failed to spawn ${AGY_BIN}: ${(err as Error).message}`;
     logEvent(task, { event: "spawn_error", error });
@@ -704,15 +855,7 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
   }
   logEvent(task, { event: "spawn", code: 0, ms: Date.now() - t0, pid: child.pid });
 
-  // Progress bridge start: fired exactly once, before any mirrored line, right
-  // after the child spawned and the .stream file exists — the earliest point a
-  // caller can associate taskId with streamPath.
-  opts.onTaskStart?.(task.id, task.streamFile);
-
-  // Primary termination is idle-based (resets on every stdout/stderr chunk);
-  // DEFAULT_PRINT_TIMEOUT_MS > 0 opts into an additional hard wall ceiling.
-  // Both send SIGTERM first and SIGKILL after a 5s grace period.
-  let killedKind: "idle" | "wall" | null = null;
+  let killedKind: "idle" | "wall" | "exit" | "abort" | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let wallTimer: ReturnType<typeof setTimeout> | null = null;
   let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
@@ -732,14 +875,33 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
     }
   };
 
+  let onAbort: (() => void) | null = null;
+  if (opts.signal) {
+    onAbort = () => {
+      if (killedKind === null) killedKind = "abort";
+      clearTimers();
+      killProcessGroup(child, "SIGKILL");
+    };
+    if (opts.signal.aborted) {
+      onAbort();
+    } else {
+      opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+
+  // Progress bridge start: fired exactly once, before any mirrored line, right
+  // after the child spawned and the .stream file exists — the earliest point a
+  // caller can associate taskId with streamPath.
+  opts.onTaskStart?.(task.id, task.streamFile);
+
   const triggerKill = (kind: "idle" | "wall", ms: number) => {
     if (killedKind !== null) return;
     killedKind = kind;
     clearTimers();
     logEvent(task, { event: "timeout", kind, timeout_ms: ms, signal: "SIGTERM" });
-    child.kill("SIGTERM");
+    killProcessGroup(child, "SIGTERM");
     // Backstop for a child that ignores SIGTERM; a no-op if it already died.
-    sigkillTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    sigkillTimer = setTimeout(() => killProcessGroup(child, "SIGKILL"), 5_000);
     sigkillTimer.unref?.();
   };
 
@@ -761,7 +923,7 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
   const collector = createStreamCollector(task.streamFile, opts.onStreamLine);
   let stdoutBuf = "";
   let stderr = "";
-  child.stdout?.on("data", (d) => {
+  const onStdout = (d: Buffer | string) => {
     resetIdle();
     stdoutBuf += d.toString();
     let nl = stdoutBuf.indexOf("\n");
@@ -771,11 +933,13 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
       collector.pushLine(line);
       nl = stdoutBuf.indexOf("\n");
     }
-  });
-  child.stderr?.on("data", (d) => {
+  };
+  const onStderr = (d: Buffer | string) => {
     resetIdle();
     stderr += d.toString();
-  });
+  };
+  child.stdout?.on("data", onStdout);
+  child.stderr?.on("data", onStderr);
 
   const outcome = await new Promise<{
     exitCode: number | null;
@@ -788,14 +952,41 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
       settled = true;
       clearTimers();
       activeChildren.delete(child);
+      if (onAbort && opts.signal) {
+        opts.signal.removeEventListener("abort", onAbort);
+      }
+      child.stdout?.off("data", onStdout);
+      child.stderr?.off("data", onStderr);
+      if (killedKind === null) killedKind = "exit";
       resolve({ exitCode: o.exitCode ?? null, exitSignal: o.exitSignal ?? null, spawnError: o.spawnError });
     };
     child.on("error", (err) => done({ spawnError: err }));
     child.on("close", (code, signal) => done({ exitCode: code, exitSignal: signal ?? null }));
     child.on("exit", (code, signal) => {
+      // The child is gone: its idle and wall timers describe ITS liveness, so
+      // disarm them right now. Marking the run as exited also stops a late
+      // chunk from a lingering descendant from re-arming the idle timer
+      // (audit A6): without this the idle kill fires during the 2s grace and
+      // the finished run is misreported as a timeout.
+      if (killedKind === null) killedKind = "exit";
+      if (idleTimer !== null) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      if (wallTimer !== null) {
+        clearTimeout(wallTimer);
+        wallTimer = null;
+      }
       // Print mode is one-shot, but if a descendant ever holds the stdio pipes
       // open, `close` would stall past the real exit — settle shortly after.
-      setTimeout(() => done({ exitCode: code ?? null, exitSignal: signal ?? null }), 2_000).unref?.();
+      setTimeout(() => {
+        if (settled) return;
+        child.stdout?.off("data", onStdout);
+        child.stderr?.off("data", onStderr);
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        done({ exitCode: code ?? null, exitSignal: signal ?? null });
+      }, 2_000).unref?.();
     });
   });
 
@@ -830,6 +1021,9 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
   } else if (killedKind === "wall") {
     status = "timeout";
     error = `task exceeded hard cap of ${wallTimeoutMs}ms; killed (SIGTERM first, SIGKILL after 5s)`;
+  } else if (killedKind === "abort") {
+    status = "error";
+    error = "task was cancelled";
   } else if (outcome.exitCode === 0 && cliStatus === "SUCCESS") {
     status = "success";
   } else {
@@ -898,29 +1092,75 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
   return result;
 }
 
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  const pid = child.pid;
+  if (pid && pid > 0) {
+    try {
+      process.kill(pid, 0);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === "ESRCH") return Promise.resolve(true);
+    }
+  }
+  return new Promise<boolean>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      child.off("exit", onDone);
+      child.off("close", onDone);
+    };
+    const onDone = () => {
+      cleanup();
+      resolve(true);
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      resolve(false);
+    }, timeoutMs);
+    child.once("exit", onDone);
+    child.once("close", onDone);
+  });
+}
+
+let shutdownPromise: Promise<{ killed: number }> | null = null;
+
 /**
  * Server shutdown policy, invoked on SIGINT/SIGTERM (and before EPIPE exits):
  * kill still-running headless task children. A headless child is a one-shot
  * process — there is no pane a human could attach to, so leaving one behind
  * would only orphan model usage in the background.
  */
-export function shutdownRunner(): { killed: number } {
-  let killedCount = 0;
-  for (const [child, clearTimers] of activeChildren) {
-    clearTimers();
+export async function shutdownRunner(): Promise<{ killed: number }> {
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = (async () => {
     try {
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 5_000).unref?.();
-    } catch {
-      /* per-child best effort */
+      const entries = Array.from(activeChildren.entries());
+      activeChildren.clear();
+      let killedCount = 0;
+      await Promise.all(
+        entries.map(async ([child, clearTimers]) => {
+          clearTimers();
+          killedCount++;
+          killProcessGroup(child, "SIGTERM");
+          const exited = await waitForChildExit(child, 1_500);
+          if (!exited) {
+            killProcessGroup(child, "SIGKILL");
+            await waitForChildExit(child, 500);
+          }
+        })
+      );
+      if (killedCount > 0) {
+        console.error(`[agy-agent-mcp] shutdown: killed ${killedCount} in-flight headless task(s)`);
+      }
+      return { killed: killedCount };
+    } finally {
+      shutdownPromise = null;
     }
-    killedCount++;
-  }
-  activeChildren.clear();
-  if (killedCount > 0) {
-    console.error(`[agy-agent-mcp] shutdown: killed ${killedCount} in-flight headless task(s)`);
-  }
-  return { killed: killedCount };
+  })();
+  return shutdownPromise;
 }
 
 /** Patterns that indicate the CLI was blocked by Antigravity quota/rate limits. */
@@ -1198,15 +1438,32 @@ export function runCmd(bin: string, args: string[], timeoutMs = 10_000): Promise
     let out = "";
     child.stdout?.on("data", (d) => (out += d.toString()));
     child.stderr?.on("data", (d) => (out += d.toString()));
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    let settled = false;
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* child already gone */
+      }
+    }, timeoutMs);
     timer.unref?.();
+    const done = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve({ code: code ?? 127, stdout: out.trim() });
+    };
     child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       resolve({ code: 127, stdout: `${bin}: ${err.message}` });
     });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? 127, stdout: out.trim() });
+    child.on("close", (code) => done(code));
+    child.on("exit", (code) => {
+      setTimeout(() => done(code), 2_000).unref?.();
     });
   });
 }
