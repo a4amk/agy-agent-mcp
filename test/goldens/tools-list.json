@@ -72,6 +72,10 @@
               "minimum": 0,
               "maximum": 3600000,
               "description": "Idle timeout for the run in ms (0..3600000; 0 disables the idle kill for this run). Resets on every stdout/stderr chunk from the child; kicks in after this much child silence and kills the child (SIGTERM, then SIGKILL after 5s). Default: 900000 (AGY_MCP_IDLE_TIMEOUT_MS)."
+            },
+            "background": {
+              "type": "boolean",
+              "description": "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. Default: false."
             }
           },
           "required": [
@@ -155,6 +159,10 @@
               "minimum": 0,
               "maximum": 3600000,
               "description": "Idle timeout for the run in ms (0..3600000; 0 disables the idle kill for this run). Resets on every stdout/stderr chunk from the child; kicks in after this much child silence and kills the child (SIGTERM, then SIGKILL after 5s). Default: 900000 (AGY_MCP_IDLE_TIMEOUT_MS)."
+            },
+            "background": {
+              "type": "boolean",
+              "description": "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. Default: false."
             }
           },
           "required": [
@@ -184,6 +192,10 @@
               "minimum": 0,
               "maximum": 2000,
               "description": "Number of trailing lines to return (1..2000, default 400; 0 returns the full transcript, hard-capped at 200,000 chars)."
+            },
+            "cancel": {
+              "type": "boolean",
+              "description": "When true and the watched task is still running, stop that run immediately (kill the child process, release the delegation lock, and report the run as cancelled)."
             }
           },
           "additionalProperties": false,

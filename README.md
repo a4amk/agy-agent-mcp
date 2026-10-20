@@ -51,6 +51,16 @@ Mode is pinned per tool (`accept-edits` for `general_task`, `plan` for `explore_
 
 Every delegation mirrors live CLI events to `<AGY_MCP_STATE_DIR>/task_<id>.stream` (default `/tmp/agy-agent-mcp/tasks/task_<id>.stream`, also returned as `stream_file`). Tail that file directly (`tail -f /tmp/agy-agent-mcp/tasks/task_<id>.stream`) or call `watch_task` with no arguments from another session to view the latest run.
 
+### Handle-and-watch workflow
+
+In MCP clients that do not render MCP progress notifications (such as OpenCode v2.0.22 or Claude Code, where progress notifications are discarded or buffered while tool results render), use the **handle-and-watch workflow**:
+- **Start detached**: pass `background: true` on `general_task` or `explore_task` to start the run in the background and receive a handle immediately (`{ task_id, status: "running", stream_file, transcript_file, started: true, note: "..." }`).
+- **Poll progress**: call `watch_task` with `stream_file: "<task_id>"` (or bare ID / latest) to inspect the live transcript as it grows (`running: true`).
+- **Retrieve final result**: once the run exits, `watch_task` returns `running: false`, `finished: true`, and includes the enriched final result (`status`, `response`, `duration_seconds`, `usage`, `files_touched`, `scope_violations`, and `progress_bridge`).
+- **Cancel a detached run**: pass `cancel: true` on `watch_task` to stop a running detached task immediately (kills the child, releases the lock, and reports the run as cancelled).
+
+This handle-and-watch workflow is the way to watch a run live in a client that does not render MCP progress notifications.
+
 MCP clients that opt in by sending a `params._meta.progressToken` on a delegation call also receive the newest transcript lines live as `notifications/progress` during the run (~200ms coalesced per message, monotonic progress counter over mirrored lines, last up to 2 lines each clipped so the payload stays a slice of the transcript). At most **one delegation runs at a time**: a second `general_task` or `explore_task` arriving while one is in flight is rejected with an `isError` envelope naming the running task rather than queued; `watch_task` and the list tools are never blocked. Keep `tail -f` / `watch_task` as the zero-configuration fallback.
 
 Sample transcript:
