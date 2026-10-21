@@ -1,6 +1,6 @@
 {
   "name": "agy-agent-mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Zero-dependency MCP server for subagent-style task delegation to the Antigravity (agy) CLI: headless runs, live stream transcripts, git-audited file scope. Works with OpenCode, Claude Code, and any MCP client.",
   "type": "module",
   "main": "dist/index.js",
