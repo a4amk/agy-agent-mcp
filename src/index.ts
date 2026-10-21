@@ -782,6 +782,19 @@ function discoveryFailure(command: string, result: CmdResult): string {
 // The five tools (same handler bodies as the SDK-era server)
 // ---------------------------------------------------------------------------
 
+/**
+ * The note a `watch_task(cancel: true)` report carries when the cancel could
+ * NOT be honoured. The cancel path acts on the module-level
+ * `activeDelegation` - the delegation THIS process owns - so a run owned by
+ * another server process cannot be stopped from here. The report says so
+ * instead of leaving the caller with a bare `running: true` that looks like a
+ * working cancel.
+ */
+const CANCEL_IGNORED_HINT =
+  "The cancel request was IGNORED: the run is still in flight, but it is not owned by this server " +
+  "process - another server process started it, and only that process can cancel it (this server " +
+  "has no cross-process cancel).";
+
 const TOOLS: ToolSpec[] = [
   {
     name: "general_task",
@@ -842,7 +855,9 @@ const TOOLS: ToolSpec[] = [
       "'elapsed_seconds' and 'usage_latest'. 'content' is the raw transcript tail - read it for detail, not " +
       "for a status display. Once the run ends, the report carries the COMPLETE final result - the durable " +
       "receipt's every field, the same result general_task/explore_task returns, so a failed run reports WHY " +
-      "it failed; 'result_ready' says the durable receipt has it.",
+      "it failed; 'result_ready' says the durable receipt has it. 'hint' carries a note for the " +
+      "caller when the report needs one - e.g. a cancel that was IGNORED because the run is owned " +
+      "by another server process.",
     inputSchema: WATCH_INPUT_SCHEMA,
     handler: async (args) => {
       try {
@@ -853,46 +868,68 @@ const TOOLS: ToolSpec[] = [
         const streamFile = stringArg(args, "stream_file");
         const tailLines = intArg(args, "tail_lines", 0, 2000);
         const cancel = boolArg(args, "cancel") ?? false;
-        if (cancel && activeDelegation) {
-          let shouldCancel = false;
-          if (!streamFile) {
-            shouldCancel = true;
-          } else {
-            const resolved = resolveStreamFile(STATE_DIR, streamFile);
-            if (!("error" in resolved)) {
-              if (
-                activeDelegation.streamPath === resolved.path ||
-                activeDelegation.taskId === streamFile ||
-                (activeDelegation.taskId && resolved.path.includes(activeDelegation.taskId))
-              ) {
-                shouldCancel = true;
+        // A cancel this process cannot honour must be VISIBLE. The cancel path
+        // acts on the module-level `activeDelegation` - the delegation THIS
+        // process owns - so a run started by another server process is out of
+        // reach. `cancelIgnored` records that the request did nothing; the
+        // report then says so in its `hint` instead of leaving the caller
+        // with a bare `running: true` it cannot act on.
+        let cancelIgnored = false;
+        if (cancel) {
+          if (activeDelegation) {
+            let shouldCancel = false;
+            if (!streamFile) {
+              shouldCancel = true;
+            } else {
+              const resolved = resolveStreamFile(STATE_DIR, streamFile);
+              if (!("error" in resolved)) {
+                if (
+                  activeDelegation.streamPath === resolved.path ||
+                  activeDelegation.taskId === streamFile ||
+                  (activeDelegation.taskId && resolved.path.includes(activeDelegation.taskId))
+                ) {
+                  shouldCancel = true;
+                }
               }
             }
-          }
-          if (shouldCancel) {
-            try {
-              activeDelegation.abort?.();
-            } catch {
-              /* abort callback error swallowed */
-            }
-            if (activeDelegation.promise) {
+            if (shouldCancel) {
               try {
-                await activeDelegation.promise;
+                activeDelegation.abort?.();
               } catch {
-                /* promise rejection swallowed */
+                /* abort callback error swallowed */
               }
+              if (activeDelegation.promise) {
+                try {
+                  await activeDelegation.promise;
+                } catch {
+                  /* promise rejection swallowed */
+                }
+              }
+              activeDelegation = null;
+            } else {
+              // The delegation in flight HERE is a different run than the one
+              // the caller asked to stop.
+              cancelIgnored = true;
             }
-            activeDelegation = null;
+          } else {
+            // No delegation in flight in THIS process: a run that is still
+            // running was started by another server process, which owns it.
+            cancelIgnored = true;
           }
         }
         // The cancel path above already acted on the in-flight delegation;
         // watchTask only reads the transcript (it has no cancel option).
-        return textResult(
-          watchTask({
-            streamFile,
-            tailLines,
-          })
-        );
+        const report = watchTask({
+          streamFile,
+          tailLines,
+        });
+        // The hint says the cancel did nothing - but only while the run is
+        // still in flight: a finished run has nothing left to cancel
+        // (`finished: true` already says so).
+        if (cancelIgnored && report.running === true) {
+          report.hint = CANCEL_IGNORED_HINT;
+        }
+        return textResult(report);
       } catch (err) {
         return textResult({ error: (err as Error).message }, true);
       }
