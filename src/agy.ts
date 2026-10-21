@@ -129,6 +129,14 @@ export interface TaskOptions {
   /** OpenCode session ID (`ses_...`) attached by the client in request _meta. */
   sessionID?: string;
   /**
+   * True for a DETACHED delegation (`background: true`): the client was
+   * already answered with a handle, so the run is worth finishing even if the
+   * client goes away. A detached run's child is the ONE child a client
+   * disconnect must not kill - the MCP layer drains that run instead (an
+   * operator's SIGINT/SIGTERM still kills it).
+   */
+  detached?: boolean;
+  /**
    * Progress-bridge hooks, wired server-side only (never supplied through tool
    * arguments). onTaskStart fires exactly once right after the child spawns and
    * the .stream file exists — before any mirrored line; onStreamLine fires
@@ -875,11 +883,23 @@ function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM
 /**
  * The children the runner owns: every spawned `agy` process that is still in
  * flight - a delegation run AND a discovery command (`agy models` /
- * `agy agents`). The value is the callback that disarms that child's timers,
- * so a shutdown kills the child exactly once. A child leaves the registry when
- * it settles.
+ * `agy agents`). The value carries the callback that disarms that child's
+ * timers, so a shutdown kills the child exactly once, and whether the child
+ * belongs to a DETACHED delegation. A detached child is the one child a
+ * CLIENT DISCONNECT must leave alone (the MCP layer drains that run instead:
+ * the client was already answered with a handle, so the run is worth
+ * finishing); every other child - an abandoned foreground call's child, a
+ * hanging discovery command - has no reader left and is reaped at once. A
+ * child leaves the registry when it settles.
  */
-const activeChildren = new Map<ChildProcess, () => void>();
+interface OwnedChild {
+  /** Disarms that child's timers. */
+  clearTimers: () => void;
+  /** True when the child belongs to a DETACHED delegation (`background: true`). */
+  detached: boolean;
+}
+
+const activeChildren = new Map<ChildProcess, OwnedChild>();
 
 /**
  * The names of the actions the CLI auto-denied, as the caller would name them
@@ -1068,7 +1088,7 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
     wallTimer.unref?.();
   }
 
-  activeChildren.set(child, clearTimers);
+  activeChildren.set(child, { clearTimers, detached: opts.detached === true });
 
   const collector = createStreamCollector(task.streamFile, opts.onStreamLine);
   let stdoutBuf = "";
@@ -1355,35 +1375,61 @@ let shutdownPromise: Promise<{ killed: number }> | null = null;
  * children. A headless child is a one-shot process - there is no pane a human
  * could attach to, so leaving one behind would only orphan model usage in the
  * background.
+ *
+ * `keepDetached` leaves the child of a DETACHED delegation alone: on a client
+ * disconnect the MCP layer drains that run (the client was already answered
+ * with a handle, so the run is worth finishing), while every other child - an
+ * abandoned foreground call's child, a hanging discovery command - has no
+ * reader left and is reaped at once. Without the option EVERY child is
+ * killed, which is what an operator's SIGINT/SIGTERM must do (a drain must
+ * never be a way to keep the process alive against a signal).
  */
-export async function shutdownRunner(): Promise<{ killed: number }> {
+export async function shutdownRunner(options: { keepDetached?: boolean } = {}): Promise<{ killed: number }> {
+  if (options.keepDetached) {
+    // Deliberately NOT memoized: an in-flight disconnect shutdown must never
+    // swallow a concurrent "kill everything" (an operator's signal arriving
+    // while the drain runs).
+    return reapChildren({ keepDetached: true });
+  }
   if (shutdownPromise) return shutdownPromise;
   shutdownPromise = (async () => {
     try {
-      const entries = Array.from(activeChildren.entries());
-      activeChildren.clear();
-      let killedCount = 0;
-      await Promise.all(
-        entries.map(async ([child, clearTimers]) => {
-          clearTimers();
-          killedCount++;
-          killProcessGroup(child, "SIGTERM");
-          const exited = await waitForChildExit(child, 1_500);
-          if (!exited) {
-            killProcessGroup(child, "SIGKILL");
-            await waitForChildExit(child, 500);
-          }
-        })
-      );
-      if (killedCount > 0) {
-        console.error(`[agy-agent-mcp] shutdown: killed ${killedCount} in-flight child process(es)`);
-      }
-      return { killed: killedCount };
+      return await reapChildren({ keepDetached: false });
     } finally {
       shutdownPromise = null;
     }
   })();
   return shutdownPromise;
+}
+
+/**
+ * Kill the in-flight children (SIGTERM, then SIGKILL after 1.5s) and report
+ * how many were killed. With `keepDetached`, the child of a DETACHED
+ * delegation stays running - the caller drains that run instead.
+ */
+async function reapChildren(options: { keepDetached: boolean }): Promise<{ killed: number }> {
+  const entries = Array.from(activeChildren.entries());
+  let killedCount = 0;
+  await Promise.all(
+    entries.map(async ([child, owned]) => {
+      // The one exemption: the detached delegation's own child - the caller
+      // drains that run, so killing it here would lose the result.
+      if (options.keepDetached && owned.detached) return;
+      owned.clearTimers();
+      activeChildren.delete(child);
+      killedCount++;
+      killProcessGroup(child, "SIGTERM");
+      const exited = await waitForChildExit(child, 1_500);
+      if (!exited) {
+        killProcessGroup(child, "SIGKILL");
+        await waitForChildExit(child, 500);
+      }
+    })
+  );
+  if (killedCount > 0) {
+    console.error(`[agy-agent-mcp] shutdown: killed ${killedCount} in-flight child process(es)`);
+  }
+  return { killed: killedCount };
 }
 
 /** Patterns that indicate the CLI was blocked by Antigravity quota/rate limits. */
@@ -1982,8 +2028,9 @@ export function runCmd(bin: string, args: string[], timeoutMs = 10_000): Promise
     }, timeoutMs);
     timer.unref?.();
     // Registered before the child can settle: shutdownRunner reaps every
-    // registered child (SIGTERM, then SIGKILL after 1.5s).
-    activeChildren.set(child, clearTimer);
+    // registered child (SIGTERM, then SIGKILL after 1.5s). A discovery child
+    // is never detached: it has no reader, so a client disconnect reaps it.
+    activeChildren.set(child, { clearTimers: clearTimer, detached: false });
     const done = (code: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
       const text = out.trim();
