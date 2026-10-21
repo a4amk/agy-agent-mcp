@@ -475,10 +475,22 @@ function tryParseJsonObject(line: string): Record<string, unknown> | null {
   if (!t.startsWith("{")) return null;
   try {
     const v = JSON.parse(t);
-    return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+    return isPlainObject(v) ? v : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * A "plain object" for the runner's parsers - the shape a payload must have
+ * to be usable (a CLI `result` payload, a durable receipt).
+ *
+ * An ARRAY is NOT one: `typeof [] === "object"`, so a plain `typeof` check
+ * would let an array masquerade as a receipt (and its elements would surface
+ * as the numeric keys "0", "1", ...).
+ */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /** Best-effort append to the `.stream` transcript; returns whether bytes were written. */
@@ -647,6 +659,12 @@ export function renderToolStep(
 }
 
 /**
+ * Why a `result` event counts as "not usable" - the wording is user-visible
+ * (it ends up in the run's `error` and in the `.stream` transcript).
+ */
+const UNUSABLE_RESULT_REASON = 'the CLI printed a result event whose "result" was not an object';
+
+/**
  * Stateful line-by-line parser for `--output-format stream-json` (with
  * backwards-compatible fallback for `--output-format json`).
  *
@@ -654,6 +672,10 @@ export function renderToolStep(
  * - Objects with a string `event` field are stream events: mirrored to
  *   `streamFile` and never accumulated into `noise`. When `event === "result"`,
  *   the inner `result` object becomes the run result candidate (last one wins).
+ * - A `result` event whose inner `result` is NOT a plain object is NOT usable:
+ *   it never becomes the result candidate, and it must not vanish either - the
+ *   raw line goes to `noise` (so it reaches the run's `notes`) and the
+ *   transcript carries a trace of it (`unusableResult`).
  * - Other JSON objects are legacy result candidates (last one wins; earlier
  *   superseded candidates fall back into `noise`).
  * - Non-JSON lines go to `noise`.
@@ -661,6 +683,8 @@ export function renderToolStep(
 function createStreamCollector(streamFile?: string, onStreamLine?: (text: string) => void) {
   let json: Record<string, unknown> | null = null;
   const noise: string[] = [];
+  /** The raw line of a `result` event the runner could not use (if any). */
+  let unusableResult: string | null = null;
   let pendingLegacy: { pos: number; line: string } | null = null;
   let openStepIndex: number | null = null;
   let openToolLabel: string | null = null;
@@ -754,11 +778,17 @@ function createStreamCollector(streamFile?: string, onStreamLine?: (text: string
           }
         }
       } else if (ev === "result") {
-        const inner =
-          obj.result !== null && typeof obj.result === "object" && !Array.isArray(obj.result)
-            ? (obj.result as Record<string, unknown>)
-            : null;
-        if (!inner) return;
+        const inner = isPlainObject(obj.result) ? obj.result : null;
+        if (!inner) {
+          // The result event is not usable (its "result" is not an object):
+          // leave a trace in the transcript, so a live watcher is not blind.
+          // The raw line itself goes to the notes (see pushLine).
+          mirror(`${midLine ? "\n" : ""}== result event: unusable (${UNUSABLE_RESULT_REASON})\n`);
+          openStepIndex = null;
+          openToolLabel = null;
+          midLine = false;
+          return;
+        }
         const prefix = midLine ? "\n" : "";
         const st = typeof inner.status === "string" ? inner.status : "UNKNOWN";
         const dur = typeof inner.duration_seconds === "number" ? inner.duration_seconds : 0;
@@ -783,14 +813,17 @@ function createStreamCollector(streamFile?: string, onStreamLine?: (text: string
       }
       if (typeof obj.event === "string") {
         mirrorEvent(obj);
-        if (
-          obj.event === "result" &&
-          obj.result !== null &&
-          typeof obj.result === "object" &&
-          !Array.isArray(obj.result)
-        ) {
-          supersedeLegacy();
-          json = obj.result as Record<string, unknown>;
+        if (obj.event === "result") {
+          if (isPlainObject(obj.result)) {
+            supersedeLegacy();
+            json = obj.result;
+          } else {
+            // A result event the runner cannot use. It must NOT vanish: the
+            // raw line goes to the notes (the caller sees exactly what the
+            // CLI printed) and the transcript carries a trace of it.
+            unusableResult = line;
+            noise.push(line);
+          }
         }
         return;
       }
@@ -798,14 +831,17 @@ function createStreamCollector(streamFile?: string, onStreamLine?: (text: string
       pendingLegacy = { pos: noise.length, line };
       json = obj;
     },
-    finish(): { json: Record<string, unknown> | null; noise: string[] } {
-      return { json, noise };
+    finish(): { json: Record<string, unknown> | null; noise: string[]; unusableResult: string | null } {
+      return { json, noise, unusableResult };
     },
   };
 }
 
 /**
  * Parse complete stdout text using the same stream/legacy rules as `runTask`.
+ *
+ * `unusableResult` carries the raw line of a `result` event whose inner
+ * `result` was not a plain object (the runner could not use it).
  */
 export function parseResultLine(
   stdout: string,
@@ -813,6 +849,7 @@ export function parseResultLine(
 ): {
   json: Record<string, unknown> | null;
   noise: string[];
+  unusableResult: string | null;
 } {
   const collector = createStreamCollector(streamFile);
   for (const line of stdout.split("\n")) {
@@ -1067,7 +1104,7 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
     collector.pushLine(stdoutBuf);
     stdoutBuf = "";
   }
-  const { json, noise } = collector.finish();
+  const { json, noise, unusableResult } = collector.finish();
   const stderrLines = stderr
     .split("\n")
     .map((l) => l.trim())
@@ -1076,6 +1113,10 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
     [...noise, ...stderrLines].length > 0
       ? truncate([...noise, ...stderrLines].join("\n"), MAX_NOTES_CHARS)
       : undefined;
+  // A result event the runner could not use (its "result" was not an object)
+  // and no usable result besides it: a JSON line WAS printed, so the failure
+  // wording must not claim that there was none.
+  const unusableResultEvent = unusableResult !== null && json === null;
 
   const cliStatus = typeof json?.status === "string" ? (json.status as string).trim().toUpperCase() : "";
   // The CLI's own error message (it rides along in the result event) is the most
@@ -1117,13 +1158,20 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
       } else if (json) {
         // A result event arrived but it carried no usable status.
         error = "agy exited 0 without reporting a result status (the run failed)";
+      } else if (unusableResultEvent) {
+        // A result event arrived, but it was not usable (its "result" was not
+        // an object). It is NOT the same as "no result event": a JSON line was
+        // printed, and the raw line is in the notes.
+        error = `agy exited 0 but its result event was not usable (the run failed; ${UNUSABLE_RESULT_REASON})`;
       } else {
         // No result event at all.
         error = "agy exited 0 without producing a result event (the run failed; no JSON result line in output)";
       }
     } else {
       const what = outcome.exitCode === null ? `signal ${outcome.exitSignal ?? "unknown"}` : `code ${outcome.exitCode}`;
-      error = `agy exited with ${what}${json ? "" : " (no JSON result line in output)"}`;
+      error = `agy exited with ${what}${
+        json ? "" : unusableResultEvent ? ` (${UNUSABLE_RESULT_REASON})` : " (no JSON result line in output)"
+      }`;
     }
   }
   // A CLI error message that arrives together with a server-side cause (a
@@ -1510,6 +1558,10 @@ export function resolveStreamFile(
 
 /**
  * Read the final TaskResult from a .ndjson receipt if present.
+ *
+ * Only a PLAIN OBJECT counts as a receipt: `typeof [] === "object"`, so an
+ * array (or any other non-object) would otherwise be accepted and its
+ * elements would surface in the watch report as the numeric keys "0", "1", …
  */
 export function readNdjsonResult(ndjsonPath: string): TaskResult | null {
   if (!existsSync(ndjsonPath)) return null;
@@ -1520,8 +1572,8 @@ export function readNdjsonResult(ndjsonPath: string): TaskResult | null {
       const line = lines[i]?.trim();
       if (!line) continue;
       const parsed = tryParseJsonObject(line);
-      if (parsed && parsed.event === "result" && parsed.result && typeof parsed.result === "object") {
-        return parsed.result as TaskResult;
+      if (parsed && parsed.event === "result" && isPlainObject(parsed.result)) {
+        return parsed.result as unknown as TaskResult;
       }
     }
   } catch {
