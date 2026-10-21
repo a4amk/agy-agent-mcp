@@ -5,12 +5,14 @@
  * Transport is a hand-rolled, zero-dependency slice of the MCP stdio
  * protocol: newline-delimited JSON-RPC 2.0 over process.stdin/process.stdout
  * with exactly the request methods this package serves (initialize, ping,
- * tools/list, tools/call); every incoming notification is swallowed and every
- * other method gets JSON-RPC "Method not found". The one notification the
- * server emits itself is notifications/progress, mirroring a delegation's
- * .stream transcript to clients that opted in with a _meta.progressToken -
- * only while that request is still in flight, so a detached (background: true)
- * run emits none and is followed through watch_task instead;
+ * tools/list, tools/call); every incoming notification is swallowed - except
+ * notifications/cancelled, which aborts the matching in-flight delegation -
+ * and every other method gets JSON-RPC "Method not found". The one
+ * notification the server emits itself is notifications/progress, mirroring a
+ * delegation's .stream transcript to clients that opted in with a
+ * _meta.progressToken - only while that request is still in flight, so a
+ * detached (background: true) run emits none and is followed through
+ * watch_task instead;
  * delegations are single-flight — a second general_task/explore_task while one
  * runs is rejected, not queued. Run: `npm run build` then
  * `node dist/index.js` (bin/mcp.mjs wraps this; npm installs need compiled
@@ -250,7 +252,8 @@ function validateProperty(key: string, schema: SchemaProperty, value: unknown): 
   // An absent property is not a violation: the tool's default applies.
   if (value === undefined) return null;
   // The enum is checked first: its message names the accepted values, and for
-  // `effort` it is the exact message this server has always used.
+  // `effort` it is the message shape this server has always used
+  // ("effort must be one of <the schema's levels>, got: ...").
   if (schema.enum && !schema.enum.includes(value)) {
     return `${key} must be one of ${schema.enum.join("|")}, got: ${String(value)}`;
   }
