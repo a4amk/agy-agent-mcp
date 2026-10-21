@@ -1401,6 +1401,16 @@ const MAX_STREAM_CHARS = 200_000;
 const DEFAULT_TAIL_LINES = 400;
 
 /**
+ * The digest is a BOUNDED window over the most recent steps: a long run
+ * (hundreds of steps) must not cost the caller a huge report on every poll.
+ * `step_count` keeps reporting the TOTAL number of steps, so the truncation
+ * is self-evident (`step_count > steps.length`) - exactly as `content` /
+ * `content_len` already signal the raw tail's clipping. No extra field is
+ * needed to say it.
+ */
+const MAX_DIGEST_STEPS = 50;
+
+/**
  * The watch report: the watch-specific view of a run (liveness, transcript
  * tail, compact digest) PLUS the COMPLETE final result once the run ended.
  *
@@ -1424,8 +1434,14 @@ export interface WatchTaskReport extends Partial<TaskResult> {
    * first) - so poll on result_ready, not on finished, to get the result.
    */
   result_ready?: boolean;
-  /** Compact digest of the run so far: one entry per step, not a text dump. */
+  /**
+   * Compact digest of the run so far: one entry per step, not a text dump.
+   * BOUNDED: it holds the most recent steps only (at most `MAX_DIGEST_STEPS`,
+   * oldest -> newest inside the window), so a long run does not blow up the
+   * report.
+   */
   steps?: DigestStep[];
+  /** The TOTAL number of steps of the run - larger than steps.length when the digest was clipped. */
   step_count?: number;
   /** The last phase marker seen in the transcript (e.g. "agent_response"). */
   phase?: string;
@@ -1639,9 +1655,13 @@ export function readStreamTail(
     content_len: content.length,
   };
   // The compact digest: one entry per step, so a watching client renders a
-  // feed instead of dumping the raw transcript.
+  // feed instead of dumping the raw transcript. The feed is a BOUNDED window
+  // over the MOST RECENT steps (oldest -> newest inside the window): the
+  // digest must not grow with the length of the run, or every poll of a long
+  // run would cost the caller a lot for what should be a status check.
+  // `step_count` keeps the TOTAL, so the clipping is self-evident.
   const digest = buildDigest(lines);
-  watchFields.steps = digest.steps;
+  watchFields.steps = digest.steps.slice(-MAX_DIGEST_STEPS);
   watchFields.step_count = digest.step_count;
   if (digest.phase) watchFields.phase = digest.phase;
   if (digest.elapsed_seconds !== undefined) watchFields.elapsed_seconds = digest.elapsed_seconds;

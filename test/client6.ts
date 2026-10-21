@@ -133,6 +133,12 @@
  *     - an array (and any other non-object) in a .ndjson result event is not
  *       accepted as a receipt: watch_task carries no result fields and no
  *       numeric keys.
+ * 22. The watch digest is bounded: a run with more than 50 steps yields at most
+ *     50 digest entries (the MOST RECENT ones, oldest first inside the window)
+ *     while step_count keeps reporting the TOTAL - so the truncation is
+ *     self-evident (step_count > steps.length) and a long run does not blow up
+ *     the report; a run with few steps is unaffected. Checked at the runner
+ *     level and over MCP (watch_task).
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -4213,6 +4219,98 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     'malformed result events: the raw CLI line reaches the notes and the .stream transcript carries a trace of it, the failure wording says the result event was not usable (and a run with no result event keeps the "no JSON result line" wording), and an array is not accepted as a receipt: ok'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 22. The watch digest is bounded: a long run must not blow up the report
+// ---------------------------------------------------------------------------
+{
+  /** A .stream transcript with `n` completed read steps (oldest first). */
+  const streamWithSteps = (n: number): string =>
+    `${Array.from({ length: n }, (_, i) => `→ Read /tmp/probe/f${i}.ts\n  ⎿ ok · done in 0s`).join("\n")}\n`;
+
+  // (22a) A run with more than 50 steps: the digest keeps at most the 50 MOST
+  //       RECENT steps (oldest -> newest inside the window), while step_count
+  //       keeps reporting the TOTAL. The truncation is self-evident: there is
+  //       no extra field for it (step_count > steps.length says it).
+  const longDir = mkdtempSync(path.join(os.tmpdir(), "agy-bounded-"));
+  const longStream = path.join(longDir, "task_bounded01.stream");
+  writeFileSync(longStream, streamWithSteps(120));
+  const longReport = runner.readStreamTail(longStream);
+  const longSteps = longReport.steps ?? [];
+  if (!Array.isArray(longSteps) || longSteps.length !== 50) {
+    throw new Error(`(22a) the digest must be bounded to 50 steps, got ${longSteps.length}`);
+  }
+  if (longReport.step_count !== 120) {
+    throw new Error(`(22a) step_count must report the TOTAL number of steps: ${longReport.step_count}`);
+  }
+  if (longReport.step_count <= longSteps.length) {
+    throw new Error(`(22a) the clipping must be self-evident (step_count > steps.length): ${longReport.step_count}`);
+  }
+  if (longSteps[0]?.target !== "/tmp/probe/f70.ts" || longSteps[49]?.target !== "/tmp/probe/f119.ts") {
+    throw new Error(
+      `(22a) the kept window must be the most recent steps (oldest first): ${JSON.stringify(longSteps[0])} .. ${JSON.stringify(longSteps[49])}`
+    );
+  }
+  for (let i = 1; i < longSteps.length; i++) {
+    const prev = Number(/f(\d+)\.ts$/.exec(longSteps[i - 1]?.target ?? "")?.[1] ?? -1);
+    const cur = Number(/f(\d+)\.ts$/.exec(longSteps[i]?.target ?? "")?.[1] ?? -1);
+    if (cur !== prev + 1) {
+      throw new Error(`(22a) the kept steps must stay in order (oldest -> newest): ${JSON.stringify(longSteps)}`);
+    }
+  }
+  // The report itself stays small: the digest is what grew before.
+  if (JSON.stringify(longReport).length > 15_000) {
+    throw new Error(`(22a) the report of a long run must stay small: ${JSON.stringify(longReport).length} chars`);
+  }
+
+  // (22b) A run with few steps is completely unaffected.
+  const shortDir = mkdtempSync(path.join(os.tmpdir(), "agy-bounded-short-"));
+  const shortStream = path.join(shortDir, "task_bounded02.stream");
+  writeFileSync(shortStream, streamWithSteps(3));
+  const shortReport = runner.readStreamTail(shortStream);
+  if ((shortReport.steps ?? []).length !== 3 || shortReport.step_count !== 3) {
+    throw new Error(`(22b) a short run must be unaffected: ${JSON.stringify(shortReport)}`);
+  }
+
+  // (22c) The same over MCP: watch_task reports the bounded digest and the
+  //       total step count.
+  const boundedStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-bounded-watch-"));
+  writeFileSync(path.join(boundedStateDir, "task_bounded03.stream"), streamWithSteps(120));
+  const boundedBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(boundedBin, `#!/bin/sh\nexit 0\n`);
+  chmodSync(boundedBin, 0o755);
+  let boundedBody: Record<string, unknown> = {};
+  const { exitCode: boundedExit } = await driveMcpStdio(boundedBin, boundedStateDir, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 721, method: "initialize", params: HANDSHAKE("bounded-digest-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(721), "initialize response (id 721)");
+    io.send({
+      jsonrpc: "2.0",
+      id: 722,
+      method: "tools/call",
+      params: { name: "watch_task", arguments: { stream_file: "task_bounded03" } },
+    });
+    await io.waitUntil(() => !!io.responseFor(722), "watch_task response (id 722)");
+    boundedBody = JSON.parse(contentText(io.responseFor(722), 722)) as Record<string, unknown>;
+  });
+  if (boundedExit !== 0) {
+    throw new Error(`(22c) the bounded-digest watch suite must exit 0, got ${boundedExit}`);
+  }
+  const boundedSteps = (boundedBody.steps ?? []) as Array<{ target?: string }>;
+  if (!Array.isArray(boundedSteps) || boundedSteps.length !== 50) {
+    throw new Error(`(22c) watch_task must return a bounded digest: ${JSON.stringify(boundedBody.steps)}`);
+  }
+  if (boundedBody.step_count !== 120) {
+    throw new Error(`(22c) watch_task must report the total step count: ${JSON.stringify(boundedBody)}`);
+  }
+  if (boundedSteps[0]?.target !== "/tmp/probe/f70.ts" || boundedSteps[49]?.target !== "/tmp/probe/f119.ts") {
+    throw new Error(`(22c) watch_task must keep the most recent steps: ${JSON.stringify(boundedBody.steps)}`);
+  }
+
+  console.log(
+    "bounded watch digest: a 120-step run reports at most 50 digest entries (the most recent ones, oldest first) while step_count reports the total 120; a short run is unaffected: ok"
   );
 }
 
