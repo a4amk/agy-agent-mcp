@@ -836,7 +836,9 @@ const TOOLS: ToolSpec[] = [
       "detached (background: true) run, which never emits notifications/progress. The returned 'running' field " +
       "plus " +
       "'modified' tell a live run from an abandoned one. For a live feed prefer the compact digest: 'steps' " +
-      "(one entry per read/write/run/phase with its target, duration and token cost), 'step_count', 'phase', " +
+      "(a bounded window over the 50 MOST RECENT steps, oldest first - one entry per read/write/run/phase " +
+      "with its target, duration and token cost), 'step_count' (the TOTAL number of steps, so " +
+      "step_count > steps.length means the digest was clipped), 'phase', " +
       "'elapsed_seconds' and 'usage_latest'. 'content' is the raw transcript tail - read it for detail, not " +
       "for a status display. Once the run ends, the report carries the COMPLETE final result - the durable " +
       "receipt's every field, the same result general_task/explore_task returns, so a failed run reports WHY " +
