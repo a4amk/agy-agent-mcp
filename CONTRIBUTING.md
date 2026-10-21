@@ -46,6 +46,18 @@ node test/client.ts    # live e2e (maintainer-level: requires agy auth + a trust
 
 GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci`, `npm run lint`, and `npm test` on Node 22 for pushes to `main` and all pull requests.
 
+## Releasing
+
+- A release is a tag. On `main`, bump the version in `package.json` and the `## <version>` heading in `CHANGELOG.md` **in the same commit** as the release, then push the tag (`git tag v<version> && git push origin v<version>`). The tag push runs `.github/workflows/publish.yml`, which publishes to npm through Trusted Publishing (OIDC, no token) and creates the GitHub release. There is no manual trigger - to retry a failed release, re-run the workflow run of that tag push. npm refuses to publish the same version twice, so a run that failed *after* the publish (the GitHub release step) cannot be re-published: create that release by hand from the tag.
+- The workflow refuses to publish unless:
+  1. **the ref is a release tag** (`refs/tags/v<version>`) - a branch ref, or a tag that is not a version, is refused;
+  2. **the tag matches the `package.json` version** (`v0.3.0` publishes `0.3.0` and nothing else) - a mismatch is refused, so a tag can never publish a version other than the one it names;
+  3. **the tagged commit is on `main`** (`git merge-base --is-ancestor`) - a release cut from a side branch is refused.
+- The npm trusted publisher must name the workflow file `publish.yml` **and** the GitHub environment `release`. npm puts the publish token into the OIDC token only when the job declares that environment, so the job declares `environment: release`; without it the publish is refused - npm rejects the token (*Unable to authenticate*, or a 404 *package not found*, depending on the npm CLI version).
+- The release notes of the GitHub release come from the CHANGELOG: the `## <version>` section of the released version, plus a `**Full Changelog**` compare link against the previous release tag. The section is built before `npm publish`, and a missing or empty section fails the release - a release without its notes is not published.
+- The job runs `npm ci`, `npm run build --if-present` and `npm test` before publishing, so a red suite blocks the release.
+- The workflow runs from the tagged commit, so `publish.yml` has to be on `main` before the first release.
+
 ## Pull requests
 
 - Target the `main` branch and keep pull requests focused on a single change.

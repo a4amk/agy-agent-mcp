@@ -1,14 +1,20 @@
 # Publishes the package to npm via Trusted Publishing (OIDC): no tokens, no
 # secrets. The trusted publisher configured on npmjs.com must name this exact
 # file (publish.yml), allow "npm publish", and complete its first publish
-# within 2 days of being created.
+# within 2 days of being created. It must also name the GitHub environment
+# "release": npm only puts the publish token into the OIDC token when the job
+# declares that environment, so the job declares it below.
+#
+# A release is a tag: the workflow is triggered by the push of a "v*" tag and
+# by nothing else. The three guards below hold the release rules the job
+# cannot get from npm (npm knows the repository, the workflow file and the
+# environment - it knows nothing about branches).
 name: publish
 
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   id-token: write # Required for OIDC
@@ -17,20 +23,84 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: release # Required by the npm trusted publisher (OIDC)
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.ref_name }}
+          fetch-depth: 0 # the "is this commit on main?" guard needs the history
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false # never use caching in release builds
+      # Guard 1: the ref must be a release tag. The tag comes from the ref and
+      # is untrusted input - it is matched, never interpolated into a command.
+      - name: Guard - the ref must be a release tag
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF:-}"
+          if ! printf '%s\n' "$ref" | grep -Eq '^refs/tags/v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::refusing to publish: GITHUB_REF '${ref}' is not a release tag (expected refs/tags/v<version>)"
+            exit 1
+          fi
+      # Guard 2: the tag must match the version that is about to be published,
+      # so a tag can never publish a different version than it names.
+      - name: Guard - the tag must match the package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME:-}"
+          case "$tag" in
+            v*) version="${tag#v}" ;;
+            *) version="" ;;
+          esac
+          if [ -z "$version" ]; then
+            echo "::error::refusing to publish: GITHUB_REF_NAME '${tag}' is not a v-prefixed version tag"
+            exit 1
+          fi
+          package_version="$(node -p 'require("./package.json").version' 2>/dev/null || true)"
+          if [ -z "$package_version" ]; then
+            echo "::error::refusing to publish: could not read the version from package.json"
+            exit 1
+          fi
+          if [ "$package_version" != "$version" ]; then
+            echo "::error::refusing to publish: tag '${tag}' does not match the package.json version '${package_version}'"
+            exit 1
+          fi
+      # Guard 3: the tagged commit must be on main. A release is cut from main,
+      # not from a side branch.
+      - name: Guard - the tagged commit must be on main
+        run: |
+          set -euo pipefail
+          sha="${GITHUB_SHA:-}"
+          if ! printf '%s\n' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::refusing to publish: GITHUB_SHA '${sha}' is not a commit sha"
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null; then
+            echo "::error::refusing to publish: commit ${sha} is not in the checked-out history"
+            exit 1
+          fi
+          if ! git fetch --no-tags --quiet origin '+refs/heads/main:refs/remotes/origin/main'; then
+            echo "::error::refusing to publish: could not fetch origin/main"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::refusing to publish: the tagged commit ${sha} is not on main - a release is cut from main, not from a side branch"
+            exit 1
+          fi
+      # The release notes come from the CHANGELOG, so the breaking changes
+      # reach the npm release page. This runs before npm publish: a missing
+      # CHANGELOG section must fail the release, not publish an empty one.
+      - name: Build the release notes from the CHANGELOG
+        run: bash .github/scripts/release-notes.sh "${RUNNER_TEMP}/release-notes.md"
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
       - run: npm ci
       - run: npm run build --if-present
       - run: npm test
       - run: npm publish
       - name: Create GitHub release
-        run: gh release create "${GITHUB_REF_NAME}" --generate-notes
+        run: gh release create "${GITHUB_REF_NAME}" --notes-file "${RUNNER_TEMP}/release-notes.md"
         env:
           GITHUB_TOKEN: ${{ github.token }}
