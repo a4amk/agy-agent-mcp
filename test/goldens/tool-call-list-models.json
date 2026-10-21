@@ -3,7 +3,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"models\": \"cached: no models found\\nagi / gemini / claude\"\n}"
+        "text": "{\n  \"models\": \"cached: no models found\\nagi / gemini / claude\",\n  \"model_ids\": [],\n  \"note\": \"the `agy models` output could not be parsed into model ids (no TAB-separated lines)\"\n}"
       }
     ],
     "isError": false

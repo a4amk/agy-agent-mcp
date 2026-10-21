@@ -206,7 +206,7 @@
       {
         "name": "list_models",
         "title": "List available agy models",
-        "description": "List model IDs usable for the `model` parameter of delegation tools.",
+        "description": "List model IDs usable for the `model` parameter of delegation tools. The raw `agy models` output is returned in `models` and the parsed IDs in `model_ids` (a line of the CLI output is an id when it contains a TAB; the id is the text before it). A failing `agy models` (missing binary, non-zero exit, timeout) is reported as an error - `isError: true` with an `error` naming the command and the failure - never as a model list.",
         "inputSchema": {
           "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",
@@ -220,7 +220,7 @@
       {
         "name": "list_agents",
         "title": "List available agy agents",
-        "description": "List agent profiles usable for the `agent` parameter of delegation tools.",
+        "description": "List agent profiles usable for the `agent` parameter of delegation tools. A failing `agy agents` (missing binary, non-zero exit, timeout) is reported as an error - `isError: true` with an `error` naming the command and the failure - never as an agent list.",
         "inputSchema": {
           "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",

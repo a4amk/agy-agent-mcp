@@ -1749,47 +1749,110 @@ export function watchTask(opts?: {
 // ---------------------------------------------------------------------------
 
 /**
+ * How a helper command ended. The three failure modes mean different things
+ * to a caller, so they are never collapsed into one another: "spawn" = the
+ * command could not be started at all (e.g. a missing binary), "exit" = it
+ * ran and exited non-zero, "timeout" = it never finished.
+ */
+export type CmdOutcome = "ok" | "spawn" | "exit" | "timeout";
+
+/** The result of one helper command: its exit code, its combined output and how it ended. */
+export interface CmdResult {
+  /** Process exit code; null when the process never ran or was killed before it could report one. */
+  code: number | null;
+  /** Combined stdout + stderr of the command, trimmed. */
+  stdout: string;
+  /** "ok" when the command succeeded; the failure mode otherwise. */
+  outcome: CmdOutcome;
+  /** Failure detail: the spawn error, the timeout limit, or the exit code / signal. */
+  reason: string;
+}
+
+/**
  * Spawn a helper command and collect its combined output. Only used for
  * discovery (`agy models` / `agy agents`), never for delegation runs.
+ *
+ * The outcome is reported, never swallowed: a caller can tell a missing
+ * binary from a non-zero exit from a timeout, and the captured output is
+ * carried along so a failure is not dressed up as a result.
  */
-export function runCmd(bin: string, args: string[], timeoutMs = 10_000): Promise<{ code: number; stdout: string }> {
+export function runCmd(bin: string, args: string[], timeoutMs = 10_000): Promise<CmdResult> {
   return new Promise((resolve) => {
     let child: ChildProcess;
     try {
       child = spawn(bin, args, { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
     } catch (err) {
-      resolve({ code: 127, stdout: `${bin}: ${(err as Error).message}` });
+      resolve({ code: null, stdout: "", outcome: "spawn", reason: `${bin}: ${(err as Error).message}` });
       return;
     }
     let out = "";
     child.stdout?.on("data", (d) => (out += d.toString()));
     child.stderr?.on("data", (d) => (out += d.toString()));
     let settled = false;
-    const timer = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settle = (result: CmdResult) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve(result);
+    };
+    const timedOut = (): CmdResult => ({
+      code: null,
+      stdout: out.trim(),
+      outcome: "timeout",
+      reason: `timed out after ${timeoutMs} ms`,
+    });
+    timer = setTimeout(() => {
       try {
         child.kill("SIGKILL");
       } catch {
         /* child already gone */
       }
+      // A timeout is reported as a timeout, not as an exit code: the old
+      // `code ?? 127` made it indistinguishable from a missing binary.
+      settle(timedOut());
     }, timeoutMs);
     timer.unref?.();
-    const done = (code: number | null) => {
+    const done = (code: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.stdout?.destroy();
-      child.stderr?.destroy();
-      resolve({ code: code ?? 127, stdout: out.trim() });
+      const text = out.trim();
+      if (code === 0) {
+        settle({ code: 0, stdout: text, outcome: "ok", reason: "" });
+        return;
+      }
+      settle({
+        code,
+        stdout: text,
+        outcome: "exit",
+        reason:
+          code !== null ? `exited with code ${code}` : `terminated by signal ${signal ?? "unknown"} (no exit code)`,
+      });
     };
     child.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ code: 127, stdout: `${bin}: ${err.message}` });
+      // The command could not be started (e.g. ENOENT): no exit code at all.
+      settle({ code: null, stdout: out.trim(), outcome: "spawn", reason: `${bin}: ${err.message}` });
     });
-    child.on("close", (code) => done(code));
-    child.on("exit", (code) => {
-      setTimeout(() => done(code), 2_000).unref?.();
+    child.on("close", (code, signal) => done(code, signal));
+    child.on("exit", (code, signal) => {
+      setTimeout(() => done(code, signal), 2_000).unref?.();
     });
   });
+}
+
+/**
+ * Parse the model ids out of `agy models` output. A line yields an id when it
+ * contains a TAB (the id is the text before the first TAB); a line without a
+ * TAB - e.g. the "Fetching available models..." header - is not an id.
+ */
+export function parseModelIds(output: string): string[] {
+  const ids: string[] = [];
+  for (const line of output.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    const id = line.slice(0, tab).trim();
+    if (id) ids.push(id);
+  }
+  return ids;
 }
