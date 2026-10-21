@@ -42,7 +42,7 @@ From a local checkout (`npm install` first): `opencode mcp add agy -- "$(pwd)/bi
 | `general_task` | Delegate a general-purpose coding task (`--mode accept-edits`, default `effort: "medium"`) and wait for the full report. |
 | `explore_task` | Delegate a read-only exploration or diagnosis task (`--mode plan`, default `effort: "low"`) and wait for the report. |
 | `watch_task` | Read the live or recent `.stream` transcript (`stream_file` optional, defaults to latest; `tail_lines` `0..2000`, default `400`); once the run ends, the report carries the complete final result. |
-| `list_models` | List model IDs accepted by `model`. |
+| `list_models` | List model IDs accepted by `model` (`models` = the raw `agy models` output, `model_ids` = the IDs parsed out of it). |
 | `list_agents` | List agent profiles accepted by `agent`. |
 
 Mode is pinned per tool (`accept-edits` for `general_task`, `plan` for `explore_task`), while `model`, `agent`, and `effort` (`low`, `medium`, `high` — the levels the available models accept) are optional per call.
@@ -50,6 +50,8 @@ Mode is pinned per tool (`accept-edits` for `general_task`, `plan` for `explore_
 Model IDs come in two shapes: a bare ID (`gemini-3.8-flash`) that takes its tier from `effort`, and a tier-carrying ID (`gemini-3.8-flash-high`, as returned by `list_models`) that already encodes it. A tier-carrying ID wins over `effort`: no `--effort` flag is passed for it, and combining it with a *different* effort is refused locally (the `agy` CLI rejects that combination outright).
 
 Call arguments are validated against the schema the server advertises in `tools/list`, before anything is spawned: a missing, empty, or whitespace-only `prompt`, a wrong-typed or out-of-range argument (`timeout_ms` `0..3600000`, `tail_lines` `0..2000`, `effort` `low|medium|high`), and an unknown argument key are all refused with the usual `{"error": "..."}` envelope (`isError: true`), and the message names the offending argument. A refused call starts no task, writes no transcript, and releases the single-flight lock.
+
+The discovery tools (`list_models`, `list_agents`) report failures as failures: when `agy models` / `agy agents` cannot be started (missing binary), exits non-zero, or does not finish within 30 s, the tool answers with the usual `{"error": "..."}` envelope (`isError: true`) — the message names the command, the failure mode and the exit code, and keeps the captured output inside it. A crash is never dressed up as a model list. A command that succeeds but prints nothing is **not** an error: `list_models` then says so in `models` and returns an empty `model_ids` (with a `note`), and `list_agents` reports that no custom agents are configured. `model_ids` holds the IDs parsed out of the CLI's output: a line is an ID when it contains a TAB, and the ID is the text before that TAB (the `Fetching available models...` header is not an ID).
 
 ## Watching a run live
 

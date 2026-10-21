@@ -3629,5 +3629,191 @@ const HANDSHAKE = (clientName: string) => ({
   );
 }
 
+// ---------------------------------------------------------------------------
+// 19. Discovery failures are ERRORS: list_models / list_agents must never
+//     dress a crash up as a result
+// ---------------------------------------------------------------------------
+{
+  /** A discovery command that fails with a non-zero exit. */
+  const DISCOVERY_FAIL_BODY = [`echo "agy exploded" >&2`, "exit 7"].join("\n");
+  /** A discovery command that succeeds and prints a TAB-separated model list. */
+  const DISCOVERY_OK_BODY = [
+    `printf '%s\\n' 'Fetching available models...'`,
+    `printf 'gemini-4-argon-medium\\tGemini 4 Argon (Medium)\\n'`,
+    `printf 'gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n'`,
+  ].join("\n");
+  /** A discovery command that never finishes. */
+  const DISCOVERY_HANG_BODY = ["sleep 5"].join("\n");
+  const writeDiscoveryFake = (body: string): string => {
+    const bin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+    writeFileSync(bin, `#!/bin/sh\n${body}\n`);
+    chmodSync(bin, 0o755);
+    return bin;
+  };
+
+  // (a) A FAILING discovery command is an error, not a result.
+  {
+    const stateDir = mkdtempSync(path.join(os.tmpdir(), "agy-discovery-fail-"));
+    const captured: Record<string, { isError: boolean; body: Record<string, unknown> }> = {};
+    const { exitCode } = await driveMcpStdio(writeDiscoveryFake(DISCOVERY_FAIL_BODY), stateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 501, method: "initialize", params: HANDSHAKE("discovery-fail-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(501), "initialize response (id 501)");
+      let id = 502;
+      for (const tool of ["list_models", "list_agents"]) {
+        id += 1;
+        io.send({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name: tool, arguments: {} },
+        });
+        await io.waitUntil(() => !!io.responseFor(id), `response (id ${id})`);
+        const resp = io.responseFor(id);
+        captured[tool] = {
+          isError: resp?.result?.isError === true,
+          body: JSON.parse(contentText(resp, id)) as Record<string, unknown>,
+        };
+      }
+    });
+    if (exitCode !== 0) {
+      throw new Error(`discovery-failure suite must exit 0, got ${exitCode}`);
+    }
+    for (const tool of ["list_models", "list_agents"]) {
+      const r = captured[tool];
+      if (!r) {
+        throw new Error(`(19a) ${tool} must answer at all`);
+      }
+      if (r.isError !== true) {
+        throw new Error(`(19a) a failing ${tool} must be flagged isError: ${JSON.stringify(r)}`);
+      }
+      // The house failure envelope: one key, "error".
+      if (Object.keys(r.body).join(",") !== "error") {
+        throw new Error(`(19a) a failing ${tool} must use the {"error": ...} envelope: ${JSON.stringify(r.body)}`);
+      }
+      const msg = String(r.body.error ?? "");
+      // The message names the command, the failure mode and the exit code.
+      const command = tool === "list_models" ? "agy models" : "agy agents";
+      if (!msg.includes(command)) {
+        throw new Error(`(19a) the ${tool} error must name the command "${command}": ${msg}`);
+      }
+      if (!/\bcode 7\b/.test(msg)) {
+        throw new Error(`(19a) the ${tool} error must name the exit code: ${msg}`);
+      }
+      // The captured output is preserved inside the message.
+      if (!msg.includes("agy exploded")) {
+        throw new Error(`(19a) the ${tool} error must keep the captured output: ${msg}`);
+      }
+      // The crash output is never presented as the result.
+      if (r.body.models !== undefined || r.body.agents !== undefined) {
+        throw new Error(`(19a) a failing ${tool} must not carry a result field: ${JSON.stringify(r.body)}`);
+      }
+    }
+  }
+
+  // (b) A SUCCESSFUL discovery command still answers, with the parsed ids.
+  {
+    const stateDir = mkdtempSync(path.join(os.tmpdir(), "agy-discovery-ok-"));
+    const captured: Record<string, { isError: boolean; body: Record<string, unknown> }> = {};
+    const { exitCode } = await driveMcpStdio(writeDiscoveryFake(DISCOVERY_OK_BODY), stateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 511, method: "initialize", params: HANDSHAKE("discovery-ok-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(511), "initialize response (id 511)");
+      let id = 512;
+      for (const tool of ["list_models", "list_agents"]) {
+        id += 1;
+        io.send({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name: tool, arguments: {} },
+        });
+        await io.waitUntil(() => !!io.responseFor(id), `response (id ${id})`);
+        const resp = io.responseFor(id);
+        captured[tool] = {
+          isError: resp?.result?.isError === true,
+          body: JSON.parse(contentText(resp, id)) as Record<string, unknown>,
+        };
+      }
+    });
+    if (exitCode !== 0) {
+      throw new Error(`discovery-success suite must exit 0, got ${exitCode}`);
+    }
+    const models = captured.list_models;
+    if (!models) {
+      throw new Error("(19b) list_models must answer at all");
+    }
+    if (models.isError !== false) {
+      throw new Error(`(19b) a successful list_models must not be flagged: ${JSON.stringify(models)}`);
+    }
+    if (typeof models.body.models !== "string" || !models.body.models.includes("gemini-3.8-flash-high")) {
+      throw new Error(`(19b) list_models must still answer with the raw output: ${JSON.stringify(models.body)}`);
+    }
+    const ids = models.body.model_ids;
+    if (!Array.isArray(ids)) {
+      throw new Error(`(19b) list_models must carry the parsed ids: ${JSON.stringify(models.body)}`);
+    }
+    if (JSON.stringify(ids) !== JSON.stringify(["gemini-4-argon-medium", "gemini-3.8-flash-high"])) {
+      throw new Error(`(19b) list_models must parse the ids out of the output: ${JSON.stringify(ids)}`);
+    }
+    if (ids.some((id) => String(id).includes("Fetching"))) {
+      throw new Error(`(19b) the header line must not be parsed as an id: ${JSON.stringify(ids)}`);
+    }
+    const agents = captured.list_agents;
+    if (!agents) {
+      throw new Error("(19b) list_agents must answer at all");
+    }
+    if (agents.isError !== false) {
+      throw new Error(`(19b) a successful list_agents must not be flagged: ${JSON.stringify(agents)}`);
+    }
+    if (typeof agents.body.agents !== "string" || agents.body.agents.length === 0) {
+      throw new Error(`(19b) list_agents must still answer with its output: ${JSON.stringify(agents.body)}`);
+    }
+  }
+
+  // (c) Unit level: runCmd keeps the three failure modes apart, and the
+  //     model ids are parsed out of the CLI's output.
+  {
+    const missing = await runner.runCmd("/nonexistent/agy-binary", ["models"], 1_000);
+    if (missing.outcome !== "spawn" || missing.code !== null) {
+      throw new Error(`(19c) a missing binary must be a spawn failure: ${JSON.stringify(missing)}`);
+    }
+    if (!missing.reason.includes("ENOENT")) {
+      throw new Error(`(19c) a spawn failure must keep the spawn error: ${JSON.stringify(missing)}`);
+    }
+    const failed = await runner.runCmd(writeDiscoveryFake(DISCOVERY_FAIL_BODY), ["models"], 5_000);
+    if (failed.outcome !== "exit" || failed.code !== 7) {
+      throw new Error(`(19c) a non-zero exit must report its code: ${JSON.stringify(failed)}`);
+    }
+    if (!failed.stdout.includes("agy exploded")) {
+      throw new Error(`(19c) a failed command must keep its output: ${JSON.stringify(failed)}`);
+    }
+    const ok = await runner.runCmd(writeDiscoveryFake(DISCOVERY_OK_BODY), ["models"], 5_000);
+    if (ok.outcome !== "ok" || ok.code !== 0) {
+      throw new Error(`(19c) a successful command must report success: ${JSON.stringify(ok)}`);
+    }
+    const hung = await runner.runCmd(writeDiscoveryFake(DISCOVERY_HANG_BODY), ["models"], 300);
+    if (hung.outcome !== "timeout" || hung.code !== null) {
+      throw new Error(`(19c) a hanging command must be a timeout, not an exit code: ${JSON.stringify(hung)}`);
+    }
+    if (!/timed out/i.test(hung.reason)) {
+      throw new Error(`(19c) a timeout must name the limit: ${JSON.stringify(hung)}`);
+    }
+    const parsedIds = runner.parseModelIds(
+      "Fetching available models...\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\n"
+    );
+    if (JSON.stringify(parsedIds) !== JSON.stringify(["gemini-4-argon-medium", "gemini-3.8-flash-high"])) {
+      throw new Error(`(19c) the model ids must be the text before the first TAB: ${JSON.stringify(parsedIds)}`);
+    }
+    if (runner.parseModelIds("Fetching available models...\nagy / gemini / claude").length !== 0) {
+      throw new Error("(19c) a line without a TAB must not be parsed as an id");
+    }
+  }
+
+  console.log(
+    'discovery errors: a failing list_models/list_agents comes back as isError with the house {"error": ...} envelope naming the command and the exit code (the crash output stays inside the message, never as the result), a successful one still answers with the raw output and the parsed model ids: ok'
+  );
+}
+
 closeSync(0);
 console.log("=== OFFLINE TESTS PASS ===");

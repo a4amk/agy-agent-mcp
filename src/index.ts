@@ -21,10 +21,12 @@ import path from "node:path";
 import {
   AGY_BIN,
   ALLOW_AUTO_APPROVE,
+  type CmdResult,
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_PRINT_TIMEOUT_MS,
   type EffortLevel,
   modelTier,
+  parseModelIds,
   RETENTION_DAYS,
   ROOT,
   resolveStreamFile,
@@ -732,6 +734,30 @@ async function runDelegation(
 }
 
 // ---------------------------------------------------------------------------
+// Discovery failures: a discovery command that did not succeed is an error
+// ---------------------------------------------------------------------------
+
+/**
+ * The house failure message for a discovery command (`agy models` /
+ * `agy agents`) that did not succeed: it names the command, the failure mode
+ * and the exit code when there is one, and the captured output is preserved
+ * inside the message so nothing the CLI printed is lost.
+ */
+function discoveryFailure(command: string, result: CmdResult): string {
+  const output = result.stdout ? `\noutput: ${result.stdout}` : "";
+  switch (result.outcome) {
+    case "spawn":
+      return `\`${command}\` could not be started: ${result.reason}${output}`;
+    case "timeout":
+      return `\`${command}\` ${result.reason}${output}`;
+    case "exit":
+      return `\`${command}\` failed: ${result.reason}${output}`;
+    default:
+      return `\`${command}\` failed${output}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The five tools (same handler bodies as the SDK-era server)
 // ---------------------------------------------------------------------------
 
@@ -851,7 +877,8 @@ const TOOLS: ToolSpec[] = [
   {
     name: "list_models",
     title: "List available agy models",
-    description: "List model IDs usable for the `model` parameter of delegation tools.",
+    description:
+      "List model IDs usable for the `model` parameter of delegation tools. The raw `agy models` output is returned in `models` and the parsed IDs in `model_ids` (a line of the CLI output is an id when it contains a TAB; the id is the text before it). A failing `agy models` (missing binary, non-zero exit, timeout) is reported as an error - `isError: true` with an `error` naming the command and the failure - never as a model list.",
     inputSchema: EMPTY_INPUT_SCHEMA,
     handler: async (args) => {
       try {
@@ -859,8 +886,23 @@ const TOOLS: ToolSpec[] = [
         // take no arguments, so any key is an unknown argument.
         const invalid = validateArgs(EMPTY_INPUT_SCHEMA, args);
         if (invalid) throw new Error(invalid);
-        const { stdout } = await runCmd(AGY_BIN, ["models"], 30_000);
-        return textResult({ models: stdout || "(no output from `agy models`)" });
+        const result = await runCmd(AGY_BIN, ["models"], 30_000);
+        if (result.outcome !== "ok") {
+          return textResult({ error: discoveryFailure("agy models", result) }, true);
+        }
+        const modelIds = parseModelIds(result.stdout);
+        const body: Record<string, unknown> = {
+          models: result.stdout || "(no output from `agy models`)",
+          model_ids: modelIds,
+        };
+        if (modelIds.length === 0) {
+          // Say so instead of leaving the caller with an empty id list and
+          // no explanation of why it is empty.
+          body.note = result.stdout
+            ? "the `agy models` output could not be parsed into model ids (no TAB-separated lines)"
+            : "`agy models` produced no output, so it could not be parsed into model ids";
+        }
+        return textResult(body);
       } catch (err) {
         return textResult({ error: (err as Error).message }, true);
       }
@@ -869,15 +911,19 @@ const TOOLS: ToolSpec[] = [
   {
     name: "list_agents",
     title: "List available agy agents",
-    description: "List agent profiles usable for the `agent` parameter of delegation tools.",
+    description:
+      "List agent profiles usable for the `agent` parameter of delegation tools. A failing `agy agents` (missing binary, non-zero exit, timeout) is reported as an error - `isError: true` with an `error` naming the command and the failure - never as an agent list.",
     inputSchema: EMPTY_INPUT_SCHEMA,
     handler: async (args) => {
       try {
         const invalid = validateArgs(EMPTY_INPUT_SCHEMA, args);
         if (invalid) throw new Error(invalid);
-        const { stdout } = await runCmd(AGY_BIN, ["agents"], 30_000);
+        const result = await runCmd(AGY_BIN, ["agents"], 30_000);
+        if (result.outcome !== "ok") {
+          return textResult({ error: discoveryFailure("agy agents", result) }, true);
+        }
         return textResult({
-          agents: stdout || "(no custom agents configured; default agent will be used)",
+          agents: result.stdout || "(no custom agents configured; default agent will be used)",
         });
       } catch (err) {
         return textResult({ error: (err as Error).message }, true);
