@@ -121,6 +121,18 @@
  *       id;
  *     - a hanging `agy models` child is gone after the MCP client disconnects
  *       (it joins the runner's child registry, so the shutdown reaps it).
+ * 21. Receipt / result parsing robustness: a malformed CLI result event must
+ *     never vanish, and an array is not a receipt.
+ *     - a result event whose inner "result" is not an object fails the run, the
+ *       RAW CLI line reaches the notes (and through them the durable
+ *       receipt), the .stream transcript carries a trace of it, and the failure
+ *       wording says the result event was NOT usable - it never claims that no
+ *       JSON line was printed;
+ *     - a run with genuinely no result event keeps the "no JSON result line in
+ *       output" wording (the two cases are not described the same way);
+ *     - an array (and any other non-object) in a .ndjson result event is not
+ *       accepted as a receipt: watch_task carries no result fields and no
+ *       numeric keys.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -4017,6 +4029,190 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     "trimmed arguments: a padded model/agent/project/conversation_id reach agy trimmed (the prompt is not trimmed) and the call succeeds, a padded tier id + a conflicting effort is refused locally with the trimmed id in the message and 0 spawns, and a hanging discovery child is reaped when the client disconnects: ok"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 21. Receipt / result parsing robustness: a malformed result event must
+//     leave a trace, and an array is not a receipt
+// ---------------------------------------------------------------------------
+{
+  /** The exact line the fake CLI prints as its (unusable) result event. */
+  const MALFORMED_LINE = '{"event":"result","result":"oops"}';
+  /** A CLI whose result event carries a STRING instead of a result object. */
+  const MALFORMED_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"malformed-c1","init":{"cwd":"/work/malformed","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '${MALFORMED_LINE}'`,
+    "exit 0",
+  ].join("\n");
+  /** A CLI that prints no result event at all (the honest counterpart). */
+  const NO_RESULT_BODY = [`echo "fake agy produced nothing" >&2`, "exit 0"].join("\n");
+
+  // (21a) Runner level: the malformed result event must NOT vanish. The raw
+  //       CLI line reaches the notes (and, through them, the durable
+  //       receipt), the .stream transcript carries a line about it, and the
+  //       failure wording says the result event was NOT usable - it must not
+  //       claim that no JSON line was printed.
+  const malformed = await fakeRun(MALFORMED_BODY, { prompt: "malformed result probe", cwd: ws });
+  if (malformed.result.status !== "error") {
+    throw new Error(`(21a) a malformed result event must fail the run: ${JSON.stringify(malformed.result)}`);
+  }
+  const malformedNotes = String(malformed.result.notes ?? "");
+  if (!malformedNotes.includes(MALFORMED_LINE)) {
+    throw new Error(`(21a) the raw CLI line must reach the notes: ${JSON.stringify(malformedNotes)}`);
+  }
+  const malformedErr = String(malformed.result.error ?? "");
+  if (malformedErr.includes("no JSON result line in output")) {
+    throw new Error(`(21a) the error must not claim that no JSON line was printed: ${JSON.stringify(malformedErr)}`);
+  }
+  if (malformedErr.includes("without producing a result event")) {
+    throw new Error(
+      `(21a) the error must not claim that no result event was produced: ${JSON.stringify(malformedErr)}`
+    );
+  }
+  if (!/not usable/i.test(malformedErr)) {
+    throw new Error(`(21a) the error must say the result event was not usable: ${JSON.stringify(malformedErr)}`);
+  }
+  const malformedStream = readFileSync(String(malformed.result.stream_file), "utf8");
+  if (!malformedStream.includes("result event: unusable") || !/result/i.test(malformedStream)) {
+    throw new Error(
+      `(21a) the .stream transcript must carry a trace of the malformed event: ${JSON.stringify(malformedStream)}`
+    );
+  }
+  const malformedReceipt = runner.readNdjsonResult(String(malformed.result.transcript_file));
+  if (!malformedReceipt || !String(malformedReceipt.notes ?? "").includes(MALFORMED_LINE)) {
+    throw new Error(`(21a) the durable receipt must carry the raw CLI line: ${JSON.stringify(malformedReceipt)}`);
+  }
+
+  // (21b) The counterpart: a run with genuinely NO result event keeps the
+  //       "no JSON result line in output" wording - the two cases must not be
+  //       described the same way.
+  const noResult = await fakeRun(NO_RESULT_BODY, { prompt: "no result event probe", cwd: ws });
+  const noResultErr = String(noResult.result.error ?? "");
+  if (!noResultErr.includes("no JSON result line in output")) {
+    throw new Error(
+      `(21b) a run with no result event must keep the "no JSON result line" wording: ${JSON.stringify(noResultErr)}`
+    );
+  }
+  if (noResultErr.includes("not usable")) {
+    throw new Error(
+      `(21b) a run with no result event must not claim an unusable event: ${JSON.stringify(noResultErr)}`
+    );
+  }
+
+  // (21c) MCP layer: the caller is told the run failed (isError) and sees
+  //       exactly what the CLI printed (the raw line in the notes).
+  const mcpStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-malformed-"));
+  const mcpBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(mcpBin, `#!/bin/sh\n${MALFORMED_BODY}\n`);
+  chmodSync(mcpBin, 0o755);
+  const captured: { delegation: { isError: boolean; body: Record<string, unknown> } } = {
+    delegation: { isError: false, body: {} },
+  };
+  const { exitCode: malformedExit } = await driveMcpStdio(mcpBin, mcpStateDir, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 701, method: "initialize", params: HANDSHAKE("malformed-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(701), "initialize response (id 701)");
+    io.send({
+      jsonrpc: "2.0",
+      id: 702,
+      method: "tools/call",
+      params: { name: "general_task", arguments: { prompt: "malformed result probe", cwd: mcpStateDir } },
+    });
+    await io.waitUntil(() => !!io.responseFor(702), "tools/call response (id 702)");
+    const resp = io.responseFor(702);
+    captured.delegation.isError = resp?.result?.isError === true;
+    captured.delegation.body = JSON.parse(contentText(resp, 702)) as Record<string, unknown>;
+  });
+  if (malformedExit !== 0) {
+    throw new Error(`(21c) the malformed-result suite must exit 0, got ${malformedExit}`);
+  }
+  if (captured.delegation.isError !== true || captured.delegation.body.status !== "error") {
+    throw new Error(
+      `(21c) a malformed result event must be reported as a failed run: ${JSON.stringify(captured.delegation.body)}`
+    );
+  }
+  if (!String(captured.delegation.body.notes ?? "").includes(MALFORMED_LINE)) {
+    throw new Error(`(21c) the caller must see the raw CLI line: ${JSON.stringify(captured.delegation.body.notes)}`);
+  }
+  const mcpErr = String(captured.delegation.body.error ?? "");
+  if (mcpErr.includes("no JSON result line in output") || !/not usable/i.test(mcpErr)) {
+    throw new Error(`(21c) the failure wording must say the result event was not usable: ${JSON.stringify(mcpErr)}`);
+  }
+
+  // (21d) An ARRAY is not a receipt: `typeof [] === "object"`, so a plain
+  //       typeof check used to accept it and its elements surfaced in the
+  //       watch report as the numeric keys "0" and "1".
+  const receiptDir = mkdtempSync(path.join(os.tmpdir(), "agy-arrayreceipt-"));
+  const arrayStream = path.join(receiptDir, "task_array01.stream");
+  const arrayReceipt = path.join(receiptDir, "task_array01.ndjson");
+  writeFileSync(
+    arrayStream,
+    "session open · cwd=/work · permission_mode=accept-edits · tools=1\n== done: status=SUCCESS · 1s\n"
+  );
+  writeFileSync(arrayReceipt, `${JSON.stringify({ ts: Date.now(), event: "result", result: ["a", "b"] })}\n`);
+  if (runner.readNdjsonResult(arrayReceipt) !== null) {
+    throw new Error("(21d) an array must not be accepted as a receipt");
+  }
+  for (const bogus of [null, "oops", 42]) {
+    const bogusReceipt = path.join(receiptDir, "task_bogus01.ndjson");
+    writeFileSync(bogusReceipt, `${JSON.stringify({ ts: Date.now(), event: "result", result: bogus })}\n`);
+    if (runner.readNdjsonResult(bogusReceipt) !== null) {
+      throw new Error(`(21d) a non-object receipt (${JSON.stringify(bogus)}) must not be accepted`);
+    }
+  }
+  const arrayReport = runner.readStreamTail(arrayStream);
+  const numericKeys = Object.keys(arrayReport).filter((k) => /^\d+$/.test(k));
+  if (numericKeys.length !== 0) {
+    throw new Error(`(21d) the watch report must not carry the array's numeric keys: ${JSON.stringify(arrayReport)}`);
+  }
+  if (
+    arrayReport.status !== undefined ||
+    arrayReport.response !== undefined ||
+    arrayReport.result_ready !== false ||
+    arrayReport.finished !== true
+  ) {
+    throw new Error(`(21d) an array receipt must not produce result fields: ${JSON.stringify(arrayReport)}`);
+  }
+
+  // (21e) The same over MCP: watch_task on an array receipt carries no result
+  //       fields and no numeric keys.
+  const watchStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-arraywatch-"));
+  writeFileSync(
+    path.join(watchStateDir, "task_array01.stream"),
+    "session open · cwd=/work · permission_mode=accept-edits · tools=1\n== done: status=SUCCESS · 1s\n"
+  );
+  writeFileSync(
+    path.join(watchStateDir, "task_array01.ndjson"),
+    `${JSON.stringify({ ts: Date.now(), event: "result", result: ["a", "b"] })}\n`
+  );
+  const watchBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(watchBin, `#!/bin/sh\nexit 0\n`);
+  chmodSync(watchBin, 0o755);
+  let watchBody: Record<string, unknown> = {};
+  const { exitCode: watchExit } = await driveMcpStdio(watchBin, watchStateDir, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 711, method: "initialize", params: HANDSHAKE("array-receipt-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(711), "initialize response (id 711)");
+    io.send({
+      jsonrpc: "2.0",
+      id: 712,
+      method: "tools/call",
+      params: { name: "watch_task", arguments: { stream_file: "task_array01" } },
+    });
+    await io.waitUntil(() => !!io.responseFor(712), "watch_task response (id 712)");
+    watchBody = JSON.parse(contentText(io.responseFor(712), 712)) as Record<string, unknown>;
+  });
+  if (watchExit !== 0) {
+    throw new Error(`(21e) the array-receipt watch suite must exit 0, got ${watchExit}`);
+  }
+  const watchNumericKeys = Object.keys(watchBody).filter((k) => /^\d+$/.test(k));
+  if (watchNumericKeys.length !== 0 || watchBody.status !== undefined || watchBody.response !== undefined) {
+    throw new Error(`(21e) watch_task must not report an array receipt as a result: ${JSON.stringify(watchBody)}`);
+  }
+
+  console.log(
+    'malformed result events: the raw CLI line reaches the notes and the .stream transcript carries a trace of it, the failure wording says the result event was not usable (and a run with no result event keeps the "no JSON result line" wording), and an array is not accepted as a receipt: ok'
   );
 }
 
