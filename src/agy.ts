@@ -443,9 +443,18 @@ function effectiveIdleTimeoutMs(opts: TaskOptions): number {
 export function buildArgs(opts: TaskOptions): { args: string[]; autoApproveApplied: boolean } {
   const args = ["-p", opts.prompt, "--output-format", "stream-json"];
   let autoApproveApplied = false;
-  if (opts.conversationId) args.push("--conversation", opts.conversationId);
-  if (opts.agent) args.push("--agent", opts.agent);
-  if (opts.model) args.push("--model", opts.model);
+  // The id-like arguments are trimmed before they reach the CLI: the agy CLI
+  // compares them verbatim, so " gemini-3.8-flash " is an unknown model and
+  // " reviewer " is an unknown agent. A value that is only whitespace becomes
+  // empty and is dropped (there is no such id). The prompt is NOT trimmed
+  // (leading whitespace may be meaningful) and cwd is resolved separately.
+  const conversationId = opts.conversationId?.trim();
+  const agent = opts.agent?.trim();
+  const model = opts.model?.trim();
+  const project = opts.project?.trim();
+  if (conversationId) args.push("--conversation", conversationId);
+  if (agent) args.push("--agent", agent);
+  if (model) args.push("--model", model);
   if (opts.effort) args.push("--effort", opts.effort);
   if (opts.mode) args.push("--mode", opts.mode);
   if (opts.sandbox) args.push("--sandbox");
@@ -456,7 +465,7 @@ export function buildArgs(opts: TaskOptions): { args: string[]; autoApproveAppli
     }
   }
   for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
-  if (opts.project) args.push("--project", opts.project);
+  if (project) args.push("--project", project);
   args.push("--print-timeout", `${DEFAULT_PRINT_TIMEOUT_MS / 1000}s`);
   return { args, autoApproveApplied };
 }
@@ -826,6 +835,13 @@ function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM
   }
 }
 
+/**
+ * The children the runner owns: every spawned `agy` process that is still in
+ * flight - a delegation run AND a discovery command (`agy models` /
+ * `agy agents`). The value is the callback that disarms that child's timers,
+ * so a shutdown kills the child exactly once. A child leaves the registry when
+ * it settles.
+ */
 const activeChildren = new Map<ChildProcess, () => void>();
 
 /**
@@ -1225,9 +1241,10 @@ let shutdownPromise: Promise<{ killed: number }> | null = null;
 
 /**
  * Server shutdown policy, invoked on SIGINT/SIGTERM (and before EPIPE exits):
- * kill still-running headless task children. A headless child is a one-shot
- * process — there is no pane a human could attach to, so leaving one behind
- * would only orphan model usage in the background.
+ * kill still-running headless task children AND still-running discovery
+ * children. A headless child is a one-shot process - there is no pane a human
+ * could attach to, so leaving one behind would only orphan model usage in the
+ * background.
  */
 export async function shutdownRunner(): Promise<{ killed: number }> {
   if (shutdownPromise) return shutdownPromise;
@@ -1249,7 +1266,7 @@ export async function shutdownRunner(): Promise<{ killed: number }> {
         })
       );
       if (killedCount > 0) {
-        console.error(`[agy-agent-mcp] shutdown: killed ${killedCount} in-flight headless task(s)`);
+        console.error(`[agy-agent-mcp] shutdown: killed ${killedCount} in-flight child process(es)`);
       }
       return { killed: killedCount };
     } finally {
@@ -1704,13 +1721,12 @@ export function buildDigest(lines: string[]): {
  * High-level `watch_task` reader: picks the latest `.stream` file when
  * `streamFile` is omitted, or resolves `streamFile` within `stateDir`. Throws
  * only on path-validation errors (escaping paths).
+ *
+ * It only READS. The cancel path lives in the MCP layer (`src/index.ts`),
+ * which owns the in-flight delegation it can stop; the runner cannot see that
+ * state, so it has no cancel option.
  */
-export function watchTask(opts?: {
-  streamFile?: string;
-  tailLines?: number;
-  stateDir?: string;
-  cancel?: boolean;
-}): WatchTaskReport {
+export function watchTask(opts?: { streamFile?: string; tailLines?: number; stateDir?: string }): WatchTaskReport {
   const stateDir = path.resolve(opts?.stateDir ?? STATE_DIR);
   const tailLines = opts?.tailLines ?? DEFAULT_TAIL_LINES;
   const candidates = listStreamFiles(stateDir).slice(0, 5);
@@ -1775,12 +1791,19 @@ export interface CmdResult {
  * The outcome is reported, never swallowed: a caller can tell a missing
  * binary from a non-zero exit from a timeout, and the captured output is
  * carried along so a failure is not dressed up as a result.
+ *
+ * The child joins the runner's child registry (`activeChildren`), so a
+ * shutdown - the MCP client disconnecting, SIGINT or SIGTERM - reaps it
+ * (SIGTERM, then SIGKILL) exactly like a delegation child instead of leaving
+ * a hanging `agy models` orphaned; it leaves the registry when it settles.
  */
 export function runCmd(bin: string, args: string[], timeoutMs = 10_000): Promise<CmdResult> {
   return new Promise((resolve) => {
     let child: ChildProcess;
     try {
-      child = spawn(bin, args, { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+      // Detached, like a delegation child: the child leads its own process
+      // group, so shutdownRunner's group kill reaches it and its descendants.
+      child = spawn(bin, args, { env: process.env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     } catch (err) {
       resolve({ code: null, stdout: "", outcome: "spawn", reason: `${bin}: ${(err as Error).message}` });
       return;
@@ -1790,10 +1813,19 @@ export function runCmd(bin: string, args: string[], timeoutMs = 10_000): Promise
     child.stderr?.on("data", (d) => (out += d.toString()));
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const clearTimer = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    };
     const settle = (result: CmdResult) => {
       if (settled) return;
       settled = true;
-      if (timer) clearTimeout(timer);
+      clearTimer();
+      // The child is done with the runner's registry: it must not be reaped
+      // twice (and must not be counted as in-flight) after it settled.
+      activeChildren.delete(child);
       child.stdout?.destroy();
       child.stderr?.destroy();
       resolve(result);
@@ -1815,6 +1847,9 @@ export function runCmd(bin: string, args: string[], timeoutMs = 10_000): Promise
       settle(timedOut());
     }, timeoutMs);
     timer.unref?.();
+    // Registered before the child can settle: shutdownRunner reaps every
+    // registered child (SIGTERM, then SIGKILL after 1.5s).
+    activeChildren.set(child, clearTimer);
     const done = (code: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
       const text = out.trim();

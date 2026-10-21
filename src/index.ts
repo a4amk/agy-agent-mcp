@@ -332,6 +332,20 @@ function stringArg(args: Args, key: string): string | undefined {
   return typeof args[key] === "string" ? (args[key] as string) : undefined;
 }
 
+/**
+ * A string argument, trimmed. The id-like arguments (`model`, `agent`,
+ * `project`, `conversation_id`) are compared verbatim by the agy CLI, so a
+ * padded value (" gemini-3.8-flash ") is an unknown model / agent / project.
+ * Trimming them here means what reaches the CLI and what the error messages
+ * quote are the same value. A value that is only whitespace becomes empty and
+ * is treated as absent. The prompt is NOT trimmed (leading whitespace may be
+ * meaningful) and `cwd` is resolved by the runner.
+ */
+function trimmedStringArg(args: Args, key: string): string | undefined {
+  const value = stringArg(args, key);
+  return value === undefined ? undefined : value.trim();
+}
+
 function boolArg(args: Args, key: string): boolean | undefined {
   return typeof args[key] === "boolean" ? (args[key] as boolean) : undefined;
 }
@@ -390,15 +404,15 @@ function toOptions(
   sessionID?: string,
   presets?: { mode?: TaskOptions["mode"]; effort?: TaskOptions["effort"] }
 ): TaskOptions {
-  const model = stringArg(args, "model");
+  const model = trimmedStringArg(args, "model");
   return {
     // The advertised schema is enforced before a call reaches this point
     // (validateArgs), so every value read here is already of the type the
     // schema declares - the accessors below never silently drop one.
     prompt: stringArg(args, "prompt") as string,
     cwd: stringArg(args, "cwd"),
-    conversationId: stringArg(args, "conversation_id"),
-    agent: stringArg(args, "agent"),
+    conversationId: trimmedStringArg(args, "conversation_id"),
+    agent: trimmedStringArg(args, "agent"),
     model,
     // Local effort resolution: a model/effort conflict throws here, so
     // nothing is spawned for a call the CLI would reject. The effort LEVEL
@@ -412,7 +426,7 @@ function toOptions(
     sandbox: boolArg(args, "sandbox"),
     addDirs: stringArrayArg(args, "add_dirs"),
     editScope: stringArrayArg(args, "edit_scope"),
-    project: stringArg(args, "project"),
+    project: trimmedStringArg(args, "project"),
     timeoutMs: intArg(args, "timeout_ms", 0, 3_600_000),
     sessionID,
   };
@@ -457,22 +471,26 @@ let activeDelegation: {
   promise?: Promise<unknown>;
 } | null = null;
 
-/** House tool-error envelope naming the in-flight run (or the tool if it has not reported a task yet). */
+/**
+ * House tool-error envelope naming the in-flight run (or the tool if it has
+ * not reported a task yet).
+ *
+ * The rejection uses the same shape as every other refusal in this server: a
+ * single `{"error": "..."}` key with `isError: true`. A caller that parses the
+ * body as JSON therefore gets a message, not a parse error.
+ */
 function delegationRejectedResult(): ToolResult {
   const running = activeDelegation;
   const detail =
     running?.taskId && running.streamPath
       ? `task ${running.taskId}, stream ${running.streamPath}`
       : `tool ${running?.tool ?? "delegation"}`;
-  return {
-    content: [
-      {
-        type: "text",
-        text: `MCP error: another delegation is already running (${detail}); one agent at a time - retry after it completes`,
-      },
-    ],
-    isError: true,
-  };
+  return textResult(
+    {
+      error: `another delegation is already running (${detail}); one agent at a time - retry after it completes`,
+    },
+    true
+  );
 }
 
 /** notifications/progress emissions for a delegation are coalesced to this window. */
@@ -865,11 +883,12 @@ const TOOLS: ToolSpec[] = [
             activeDelegation = null;
           }
         }
+        // The cancel path above already acted on the in-flight delegation;
+        // watchTask only reads the transcript (it has no cancel option).
         return textResult(
           watchTask({
             streamFile,
             tailLines,
-            cancel,
           })
         );
       } catch (err) {
