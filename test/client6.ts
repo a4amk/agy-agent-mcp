@@ -146,6 +146,11 @@
  *     from the receipt; a denial WITH a response and a silent success (no
  *     denial) stay successes, and a quota failure stays a quota_error (the
  *     blocked gate runs after the quota upgrade).
+ * 25. The drain on a client disconnect: a DETACHED run (background: true)
+ *     survives the disconnect - the server lingers until the run ends and the
+ *     receipt carries the result - while an abandoned FOREGROUND call is
+ *     still killed on the disconnect, and a hanging discovery command is
+ *     reaped at the disconnect even while a detached run drains.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -4709,6 +4714,222 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     "ignored cancel: a cancel for a run this process does not own says so in the report's hint (the cancel did nothing, the run is in flight, another process owns it), a cancel that works and a cancel for a finished run carry no hint: ok"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 25. The drain: a DETACHED run survives the client disconnect (and is
+//     recorded), while an abandoned FOREGROUND call is still killed
+// ---------------------------------------------------------------------------
+{
+  /** Whether a pid is still alive. */
+  const pidAlive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
+  };
+
+  // (25a) A DETACHED run (background: true) survives the client disconnect:
+  //       the server waits for it instead of killing it, the run finishes, and
+  //       its receipt carries the result - so any client that can see the
+  //       state dir can collect it afterwards.
+  const drainAgy = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(
+    drainAgy,
+    [
+      "#!/bin/sh",
+      `printf '%s\\n' "invoke" >> "$AGY_FAKE_ARGFILE"`,
+      "sleep 1.5",
+      `printf '%s\\n' '{"event":"init","conversation_id":"drain-c1","init":{"cwd":"/work/drain","tools":[],"permission_mode":"accept-edits"}}'`,
+      `printf '%s\\n' '{"event":"result","result":{"conversation_id":"drain-c1","status":"SUCCESS","response":"PONG\\n","duration_seconds":1.5,"num_turns":1}}'`,
+      "",
+    ].join("\n")
+  );
+  chmodSync(drainAgy, 0o755);
+  const drainStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-drain-"));
+  let drainTaskId = "";
+  const drainStartedAt = Date.now();
+  const { exitCode: drainExit } = await driveMcpStdio(drainAgy, drainStateDir, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("drain-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
+    io.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "general_task",
+        arguments: {
+          prompt: "a detached run that must survive the disconnect",
+          cwd: drainStateDir,
+          background: true,
+        },
+      },
+    });
+    await io.waitUntil(() => !!io.responseFor(2), "background delegation response (id 2)");
+    const handle = JSON.parse(contentText(io.responseFor(2), 2)) as { task_id?: string; status?: string };
+    if (handle.status !== "running" || typeof handle.task_id !== "string") {
+      throw new Error(`(25a) the detached run must start running: ${JSON.stringify(handle)}`);
+    }
+    drainTaskId = handle.task_id;
+    // The run is still in flight when the handle is answered: its receipt has
+    // no result event yet.
+    const receiptPath = path.join(drainStateDir, `${handle.task_id}.ndjson`);
+    if (existsSync(receiptPath) && /"event":"result"/.test(readFileSync(receiptPath, "utf8"))) {
+      throw new Error("(25a) the detached run must still be in flight when its handle is answered");
+    }
+    // The client goes away here: driveMcpStdio ends stdin when drive returns.
+  });
+  if (drainExit !== 0) {
+    throw new Error(`(25a) the server must exit cleanly after the drained run, got ${drainExit}`);
+  }
+  // The server must have LINGERED until the run ended (the fake takes ~1.5s):
+  // it may not exit while the detached run is still going.
+  const drainElapsed = Date.now() - drainStartedAt;
+  if (drainElapsed < 1300) {
+    throw new Error(`(25a) the server must linger until the detached run ends (it left after ${drainElapsed}ms)`);
+  }
+  const drainReceiptPath = path.join(drainStateDir, `${drainTaskId}.ndjson`);
+  if (!existsSync(drainReceiptPath)) {
+    throw new Error(`(25a) the drained run must leave its receipt behind: ${drainReceiptPath}`);
+  }
+  const drainResult = readFileSync(drainReceiptPath, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line) as { event?: string; result?: { status?: string; response?: string } };
+      } catch {
+        return null;
+      }
+    })
+    .find((event) => event?.event === "result");
+  if (drainResult?.result?.status !== "success" || drainResult?.result?.response !== "PONG\n") {
+    throw new Error(`(25a) the drained run must be recorded with its result: ${JSON.stringify(drainResult)}`);
+  }
+
+  // (25b) An abandoned FOREGROUND call is still killed on the disconnect:
+  //       nobody will read its answer, so its child must not survive it.
+  const fgPidFile = path.join(tmpBase, `drain-fg-${fakeCounter++}.pid`);
+  const fgAgy = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  // The fake records its own pid and then hangs forever.
+  writeFileSync(fgAgy, `#!/bin/sh\necho $$ > ${JSON.stringify(fgPidFile)}\nexec sleep 30\n`);
+  chmodSync(fgAgy, 0o755);
+  const fgStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-drain-fg-"));
+  const { exitCode: fgExit } = await driveMcpStdio(fgAgy, fgStateDir, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("drain-fg-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
+    io.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "general_task",
+        arguments: { prompt: "an abandoned foreground call", cwd: fgStateDir },
+      },
+    });
+    // The call blocks: wait until the child is really up, then let the client
+    // go away (driveMcpStdio ends stdin on return).
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(fgPidFile) && Date.now() < deadline) await sleep(20);
+    if (!existsSync(fgPidFile)) {
+      throw new Error("(25b) the foreground child must have been spawned");
+    }
+  });
+  if (fgExit !== 0) {
+    throw new Error(`(25b) the server must exit cleanly after the disconnect, got ${fgExit}`);
+  }
+  const fgPid = Number(readFileSync(fgPidFile, "utf8").trim());
+  let fgAlive = pidAlive(fgPid);
+  const fgDeadline = Date.now() + 5_000;
+  while (fgAlive && Date.now() < fgDeadline) {
+    await sleep(50);
+    fgAlive = pidAlive(fgPid);
+  }
+  if (fgAlive) {
+    throw new Error(`(25b) the abandoned foreground child must be killed on the disconnect (pid ${fgPid})`);
+  }
+
+  // (25c) While a DETACHED run drains, the children WITHOUT a reader are
+  //       still reaped AT THE DISCONNECT: a hanging discovery command dies
+  //       right away, and only the detached run's own child survives.
+  {
+    const mixDir = mkdtempSync(path.join(os.tmpdir(), "agy-drain-mix-"));
+    const mixModelsPid = path.join(mixDir, "pid-models");
+    const mixDelegPid = path.join(mixDir, "pid-delegation");
+    const mixAgy = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+    writeFileSync(
+      mixAgy,
+      [
+        "#!/bin/sh",
+        `case " $* " in`,
+        `  *" models "*|*" agents "*)`,
+        `    echo $$ > ${JSON.stringify(mixModelsPid)}`,
+        "    exec sleep 30",
+        "    ;;",
+        "esac",
+        `echo $$ > ${JSON.stringify(mixDelegPid)}`,
+        "sleep 3",
+        `printf '%s\\n' '{"event":"result","result":{"conversation_id":"mix-c1","status":"SUCCESS","response":"PONG","duration_seconds":3,"num_turns":1}}'`,
+        "",
+      ].join("\n")
+    );
+    chmodSync(mixAgy, 0o755);
+    const mixStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-drain-mix-state-"));
+    let modelsAliveAtDisconnect: boolean | null = null;
+    let delegAliveAtDisconnect: boolean | null = null;
+    const { exitCode: mixExit } = await driveMcpStdio(mixAgy, mixStateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("drain-mix-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
+      io.send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "general_task",
+          arguments: { prompt: "a detached run that outlives the disconnect", cwd: mixStateDir, background: true },
+        },
+      });
+      await io.waitUntil(() => !!io.responseFor(2), "background delegation response (id 2)");
+      const waitFor = async (file: string, label: string): Promise<void> => {
+        const deadline = Date.now() + 10_000;
+        while (!existsSync(file) && Date.now() < deadline) await sleep(20);
+        if (!existsSync(file)) throw new Error(`(25c) ${label} must have been spawned`);
+      };
+      await waitFor(mixDelegPid, "the detached child");
+      // A discovery command that hangs: it has no reader, so the disconnect
+      // must reap it even while the detached run drains.
+      io.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_models", arguments: {} } });
+      await waitFor(mixModelsPid, "the discovery child");
+      // Look at the two children ~1.5s after the client goes away (the client
+      // disconnects as soon as this callback returns).
+      setTimeout(() => {
+        modelsAliveAtDisconnect = pidAlive(Number(readFileSync(mixModelsPid, "utf8").trim()));
+        delegAliveAtDisconnect = pidAlive(Number(readFileSync(mixDelegPid, "utf8").trim()));
+      }, 1_500);
+    });
+    if (mixExit !== 0) {
+      throw new Error(`(25c) the server must exit cleanly after the drained run, got ${mixExit}`);
+    }
+    if (modelsAliveAtDisconnect !== false) {
+      throw new Error(
+        `(25c) the discovery child must be reaped at the disconnect while a detached run drains: alive=${modelsAliveAtDisconnect}`
+      );
+    }
+    if (delegAliveAtDisconnect !== true) {
+      throw new Error(
+        `(25c) the detached run's own child must survive the disconnect: alive=${delegAliveAtDisconnect}`
+      );
+    }
+  }
+
+  console.log(
+    "client disconnect: a DETACHED run survives it (the server lingers until the run ends, and the receipt carries the result), while an abandoned FOREGROUND call is still killed and a hanging discovery command is reaped at the disconnect: ok"
   );
 }
 

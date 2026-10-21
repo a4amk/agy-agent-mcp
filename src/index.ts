@@ -14,7 +14,11 @@
  * detached (background: true) run emits none and is followed through
  * watch_task instead;
  * delegations are single-flight — a second general_task/explore_task while one
- * runs is rejected, not queued. Run: `npm run build` then
+ * runs is rejected, not queued. When the client disconnects, a DETACHED
+ * (background: true) run is finished first — the server lingers until it ends,
+ * writes its receipt and only then exits, so the result survives the client —
+ * while an abandoned foreground call is killed as before.
+ * Run: `npm run build` then
  * `node dist/index.js` (bin/mcp.mjs wraps this; npm installs need compiled
  * JavaScript — Node won't type-strip under node_modules).
  */
@@ -632,6 +636,10 @@ async function runDelegation(
     // Read BEFORE the bridge is created: whether the call stays in flight
     // decides whether notifications/progress has anything to attach to.
     background = boolArg(args, "background") ?? false;
+    // A detached run is the one run that survives a client disconnect: the
+    // client is already answered with a handle, so the run is worth
+    // finishing. The runner keeps that child out of the disconnect reaping.
+    opts.detached = background;
   } catch (err) {
     return textResult({ error: (err as Error).message }, true);
   }
@@ -1188,17 +1196,74 @@ process.stdin.on("data", (chunk: Buffer) => {
 // Stdin read errors are swallowed silently, mirroring the SDK transport.
 function ignoreStdinError(): void {}
 process.stdin.on("error", ignoreStdinError);
-// EOF ends the server gracefully: the client is gone, kill in-flight headless
-// run children the same way SIGINT/SIGTERM do below, then exit cleanly.
-async function shutdownAndExit(): Promise<void> {
+/** Set once the shutdown path has started: stdin EOF and close both fire it. */
+let shutdownStarted = false;
+
+/**
+ * Wait for the in-flight DETACHED run to finish so its receipt is written
+ * before the server leaves. A no-op when no detached run is in flight: a
+ * foreground call is abandoned instead (its child is killed by
+ * shutdownRunner - nobody would read the answer anyway).
+ */
+async function drainDetachedRun(): Promise<void> {
+  const detached = activeDelegation?.detached ? activeDelegation.promise : undefined;
+  if (!detached) return;
+  try {
+    process.stderr.write(
+      `[${SERVER_NAME}] client gone: waiting for the detached run to finish so its receipt is written\n`
+    );
+  } catch {
+    /* the client is gone - the log line is a nicety, not a contract */
+  }
+  try {
+    await detached;
+  } catch {
+    /* the run's own failure is recorded in its receipt */
+  }
+}
+
+/**
+ * The client is gone (stdin EOF/close, or a broken stdout pipe). Two cases,
+ * and they are different:
+ *
+ * - a FOREGROUND call is in flight: its answer has no reader any more, so the
+ *   call is abandoned - its child is killed right away (it has no reader
+ *   either) and the server exits;
+ * - a DETACHED run (background: true) is in flight: the client was already
+ *   answered with a handle, so the run is worth finishing. The server stays
+ *   alive until the run ends and has written its receipt, and only then
+ *   exits - the result is then collectable from any client that can see the
+ *   state dir.
+ *
+ * The reaping and the drain are two separate steps: the children WITHOUT a
+ * reader (an abandoned foreground call, a hanging discovery command) are
+ * reaped first, at once; only the detached delegation's own child is kept
+ * alive for the drain.
+ *
+ * The drain lasts as long as the run does - the run's idle timer resets on
+ * every byte it produces, so a productive run can keep the server alive for
+ * as long as it runs. SIGINT/SIGTERM is the only escape: that path never
+ * waits for the drain, it kills every child (the detached one included) and
+ * exits at once, so a drain can never be used to keep the process alive
+ * against an operator's signal.
+ */
+async function shutdownAndExit(code: number): Promise<void> {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  // Reap the children that have no reader left - now, not after the drain:
+  // an abandoned foreground call and a hanging discovery command.
+  await shutdownRunner({ keepDetached: true });
+  // Let the detached run finish so its receipt is written.
+  await drainDetachedRun();
+  // Nothing should be left, but a child that outlived its run is reaped here.
   await shutdownRunner();
-  process.exit(0);
+  process.exit(code);
 }
 process.stdin.on("end", () => {
-  void shutdownAndExit();
+  void shutdownAndExit(0);
 });
 process.stdin.on("close", () => {
-  void shutdownAndExit();
+  void shutdownAndExit(0);
 });
 
 process.stderr.write(`[${SERVER_NAME}] connected on stdio\n`);
@@ -1209,8 +1274,11 @@ process.stderr.write(`[${SERVER_NAME}] connected on stdio\n`);
 // next boot's sweep would not do anyway.
 process.on("uncaughtException", async (err) => {
   if ((err as NodeJS.ErrnoException)?.code === "EPIPE") {
-    await shutdownRunner();
-    process.exit(1);
+    // The client's pipe broke - it is gone for good. The SAME path the EOF
+    // takes (one guard, one exit code: whichever came first), so a DETACHED
+    // run still gets to finish and write its receipt.
+    await shutdownAndExit(1);
+    return;
   }
   throw err;
 });
