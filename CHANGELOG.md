@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+
+
 ## 0.3.0 - 2026-10-21
 
 ### Breaking changes
@@ -33,3 +36,5 @@ This release is a minor bump: the following change what a caller observes.
 - fixed blocked runs: a run whose tool requests were all auto-denied and that therefore produced no output at all is no longer reported as a success - it comes back with isError true, status "error" and an error that names the denied action and the way out (auto_approve: true, or a permissions.allow rule in your own Antigravity settings.json), and watch_task carries the same verdict (behaviour change: such a run used to be a "success" with an empty response; a denial that still produced a response, and a silent success without any denial, stay successes)
 - made the ignored cancel visible: a watch_task(cancel: true) for a run this server process does not own (the cancel path acts on the module-level activeDelegation, so it can only stop a run this process started) now carries a hint saying the cancel was ignored, the run is in flight and owned by another server process, and only that process can cancel it (behaviour change: such a report now has a hint field; a cancel that works and a cancel for a finished run carry no hint)
 - fixed the detached run: a background (detached) run now survives the client disconnect - on stdin EOF the server waits for the run to finish, writes its receipt and only then exits, so the result stays collectable from any client that can see the state dir (behaviour change: the server process lingers for the duration of the run instead of killing it; every other child - an abandoned foreground call, a hanging `agy models` / `agy agents` - is still reaped at the disconnect, and a SIGINT/SIGTERM still kills every child and exits the server at once)
+- added a release script: `npm run release -- <version>` prepares the version bump (`package.json` and `package-lock.json`), the changelog heading and the goldens in one command, runs the gates and creates the `chore(release): <version>` commit (it never pushes, tags or publishes - the maintainer does that, and a failed run puts the working tree back the way it was)
+- fixed the initialize goldens: the suite compares `serverInfo.version` exactly now, so a golden can no longer drift away from `package.json` unnoticed

@@ -24,8 +24,9 @@
  *    matches package.json.
  * 7. Protocol parity over stdio: the whole `test/goldens/` capture scenario
  *    replayed step-by-step against `bin/mcp.mjs` (stub AGY_BIN) — every
- *    response deep-equals its golden file (initialize serverInfo.version
- *    checked against package.json), garbage lines and notifications stay
+ *    response deep-equals its golden file (the initialize goldens carry
+ *    serverInfo.version and it is compared exactly, so a golden can never
+ *    drift away from package.json), garbage lines and notifications stay
  *    silent, duplicate initialize is answered, the boot banner is exact, and
  *    stdin EOF exits cleanly.
  * 8. Zero runtime dependencies: package.json has no (empty) dependencies
@@ -1227,9 +1228,13 @@ console.log("protocol parity vs test/goldens (bin -> dist): starting");
       if (gotInfo?.version !== pkgTest.version) {
         throw new Error(`initialize serverInfo.version ${gotInfo?.version} must match package.json ${pkgTest.version}`);
       }
-      // Everything except the version must equal the golden exactly.
-      delete gotInfo?.version;
-      delete goldenInfo?.version;
+      // The version is compared too: the golden carries the released version
+      // exactly, so it cannot drift away from package.json unnoticed.
+      if (goldenInfo?.version !== gotInfo?.version) {
+        throw new Error(
+          `golden ${s.golden} serverInfo.version ${goldenInfo?.version} must match the server's ${gotInfo?.version} (package.json ${pkgTest.version})`
+        );
+      }
     }
     if (!jsonDeepEqual(resp, golden)) {
       throw new Error(
