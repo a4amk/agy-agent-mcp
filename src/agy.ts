@@ -882,6 +882,48 @@ function killProcessGroup(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM
 const activeChildren = new Map<ChildProcess, () => void>();
 
 /**
+ * The names of the actions the CLI auto-denied, as the caller would name them
+ * ("command", "read_file", ...). The CLI reports them as objects
+ * (`{action, display_name}`); a bare string is accepted too.
+ */
+function deniedActionNames(denied: unknown[]): string[] {
+  const names: string[] = [];
+  for (const item of denied) {
+    if (typeof item === "string") {
+      const name = item.trim();
+      if (name) names.push(name);
+      continue;
+    }
+    if (!isPlainObject(item)) continue;
+    const action = typeof item.action === "string" ? item.action.trim() : "";
+    const display = typeof item.display_name === "string" ? item.display_name.trim() : "";
+    const name = action || display;
+    if (name) names.push(name);
+  }
+  return names;
+}
+
+/**
+ * The reason a blocked run gets. The CLI reaches the same conclusion on its
+ * own - it prints "no output produced - a tool required the <x> permission that
+ * headless mode cannot prompt for, so it was auto-denied" - but it still
+ * reports `status: "SUCCESS"`, so the server has to say it. The fix belongs to
+ * the caller: approve the tools for this run (`auto_approve: true`) or allow
+ * them in the user's own Antigravity `settings.json`.
+ */
+function blockedRunMessage(denied: unknown[]): string {
+  const names = deniedActionNames(denied);
+  const named = names.length > 0 ? ` (${names.join(", ")})` : "";
+  const requests = names.length === 1 ? "tool request" : "tool requests";
+  const verb = names.length === 1 ? "was" : "were";
+  return (
+    `the sub-agent was blocked: its ${requests}${named} ${verb} auto-denied because headless mode cannot ` +
+    "prompt for permission, so the run produced no output. Re-run with auto_approve: true, or add an " +
+    "allow-rule under permissions.allow in your own Antigravity settings.json (e.g. command(<target>))."
+  );
+}
+
+/**
  * Run one headless delegation to completion. Throws only for caller-caused
  * validation failures (cwd, edit_scope) before anything spawns; every other
  * failure of the run comes back as a TaskResult with an honest status.
@@ -1221,6 +1263,26 @@ export async function runTask(opts: TaskOptions): Promise<TaskResult> {
     result.quota_note =
       "The response/error output looks like an Antigravity quota or rate-limit issue (best-effort detection). " +
       "Tell the user; do not silently fall back to other agents unless the user asked for that.";
+  }
+
+  // A blocked run is not a success. The CLI reaches the same conclusion on its
+  // own - it prints "no output produced - a tool required the <x> permission
+  // that headless mode cannot prompt for, so it was auto-denied" - but it still
+  // reports status: "SUCCESS", so the server would hand the caller a success
+  // with an empty response. The gate is the CLI's OWN condition: a non-empty
+  // denied_actions AND an empty response. A run that produced a response (the
+  // agent worked around the denial) and a run that produced no response
+  // without any denial stay successes.
+  //
+  // It runs AFTER the quota upgrade, so a quota failure keeps its quota_error.
+  if (
+    result.status === "success" &&
+    Array.isArray(result.denied_actions) &&
+    result.denied_actions.length > 0 &&
+    !rawResponse.trim()
+  ) {
+    result.status = "error";
+    result.error = blockedRunMessage(result.denied_actions);
   }
 
   if (result.status === "success" && !rawResponse.trim()) {
