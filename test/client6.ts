@@ -139,6 +139,13 @@
  *     self-evident (step_count > steps.length) and a long run does not blow up
  *     the report; a run with few steps is unaffected. Checked at the runner
  *     level and over MCP (watch_task).
+ * 23. A blocked run is not a success: a run whose tool requests were all
+ *     auto-denied AND that produced no output at all comes back as a failure
+ *     (isError, status "error") with an error that names the denial, the
+ *     denied action and the way out - the watch report inherits the verdict
+ *     from the receipt; a denial WITH a response and a silent success (no
+ *     denial) stay successes, and a quota failure stays a quota_error (the
+ *     blocked gate runs after the quota upgrade).
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -4311,6 +4318,206 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     "bounded watch digest: a 120-step run reports at most 50 digest entries (the most recent ones, oldest first) while step_count reports the total 120; a short run is unaffected: ok"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 23. A blocked run is not a success: denied tool requests + no output
+// ---------------------------------------------------------------------------
+{
+  /** The CLI's own note when a tool request was auto-denied in headless mode. */
+  const DENIED_NOTE =
+    "jetski: no output produced - a tool required the command permission that headless mode cannot prompt for, so it was auto-denied.";
+  /** SUCCESS + an empty response + a denied action: the BLOCKED case. */
+  const BLOCKED_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"denied-c1","init":{"cwd":"/work/denied","tools":[],"permission_mode":"accept-edits"}}'`,
+    `echo '${DENIED_NOTE}' >&2`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"denied-c1","status":"SUCCESS","response":"","duration_seconds":1.1,"num_turns":1,"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}'`,
+  ].join("\n");
+  /** SUCCESS + a real response + the same denied action: NOT blocked. */
+  const DENIED_BUT_TALKED_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"deniedtalk-c1","init":{"cwd":"/work/denied","tools":[],"permission_mode":"accept-edits"}}'`,
+    `echo 'jetski: a tool was auto-denied.' >&2`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"deniedtalk-c1","status":"SUCCESS","response":"I could not run the command, but here is what I found.","duration_seconds":1.1,"num_turns":1,"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}'`,
+  ].join("\n");
+  /** SUCCESS + an empty response and NO denial: NOT blocked. */
+  const SILENT_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"silent-c1","init":{"cwd":"/work/silent","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"silent-c1","status":"SUCCESS","response":"","duration_seconds":1.1,"num_turns":1}}'`,
+  ].join("\n");
+  /** A blocked-looking run whose notes show a quota signature: the QUOTA classification wins. */
+  const QUOTA_DENIED_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"quotadenied-c1","init":{"cwd":"/work/quota","tools":[],"permission_mode":"accept-edits"}}'`,
+    `echo 'Error: HTTP 429 from model backend - quota exceeded for today' >&2`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"quotadenied-c1","status":"SUCCESS","response":"","duration_seconds":1.1,"num_turns":1,"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}'`,
+  ].join("\n");
+  /** A plain quota failure: the CLI reports ERROR and exits 3. */
+  const QUOTA_FAIL_BODY = [
+    `printf '%s\\n' '{"event":"init","conversation_id":"quotafail-c1","init":{"cwd":"/work/quota","tools":[],"permission_mode":"accept-edits"}}'`,
+    `echo 'error: Individual quota reached. Please upgrade your subscription.' >&2`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"quotafail-c1","status":"ERROR","response":"","error":"Individual quota reached","duration_seconds":0.4,"num_turns":1}}'`,
+    "exit 3",
+  ].join("\n");
+
+  const writeFake = (body: string): string => {
+    const bin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+    writeFileSync(bin, `#!/bin/sh\n${body}\n`);
+    chmodSync(bin, 0o755);
+    return bin;
+  };
+
+  /**
+   * One general_task over stdio. With `withWatch`, a watch_task on the SAME
+   * session follows it - the watch report is built from the durable receipt,
+   * so it must carry the same verdict.
+   */
+  const delegate = async (
+    bin: string,
+    stateDir: string,
+    id: number,
+    withWatch = false
+  ): Promise<{ isError: boolean; body: Record<string, unknown>; watch?: Record<string, unknown> }> => {
+    const captured: { isError: boolean; body: Record<string, unknown>; watch?: Record<string, unknown> } = {
+      isError: false,
+      body: {},
+    };
+    const { exitCode } = await driveMcpStdio(bin, stateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: id - 1, method: "initialize", params: HANDSHAKE("blocked-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(id - 1), `initialize response (id ${id - 1})`);
+      io.send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "blocked run probe", cwd: stateDir } },
+      });
+      await io.waitUntil(() => !!io.responseFor(id), `tools/call response (id ${id})`);
+      const resp = io.responseFor(id);
+      captured.isError = resp?.result?.isError === true;
+      captured.body = JSON.parse(contentText(resp, id)) as Record<string, unknown>;
+      if (withWatch) {
+        const watchId = id + 1;
+        io.send({
+          jsonrpc: "2.0",
+          id: watchId,
+          method: "tools/call",
+          params: { name: "watch_task", arguments: { stream_file: String(captured.body.task_id ?? "") } },
+        });
+        await io.waitUntil(() => !!io.responseFor(watchId), `watch_task response (id ${watchId})`);
+        captured.watch = JSON.parse(contentText(io.responseFor(watchId), watchId)) as Record<string, unknown>;
+      }
+    });
+    if (exitCode !== 0) {
+      throw new Error(`blocked-run suite must exit 0, got ${exitCode}`);
+    }
+    return captured;
+  };
+
+  // (23a) A blocked run (denied actions + an empty response) is a FAILURE:
+  //       isError, status "error", and an error that names the denial, the
+  //       denied action and the way out. The machine-readable denial and the
+  //       CLI's own note are kept, and the watch report inherits the verdict.
+  const blockedStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-blocked-"));
+  const blocked = await delegate(writeFake(BLOCKED_BODY), blockedStateDir, 802, true);
+  if (blocked.isError !== true) {
+    throw new Error(`(23a) a blocked run must be flagged isError: ${JSON.stringify(blocked.body)}`);
+  }
+  if (blocked.body.status !== "error") {
+    throw new Error(`(23a) a blocked run must report status=error: ${JSON.stringify(blocked.body)}`);
+  }
+  const blockedErr = String(blocked.body.error ?? "");
+  if (blockedErr.length === 0) {
+    throw new Error("(23a) a blocked run must carry a non-empty error");
+  }
+  if (!/deni/i.test(blockedErr) || !/command/i.test(blockedErr)) {
+    throw new Error(`(23a) the error must name the denial and the denied action: ${JSON.stringify(blockedErr)}`);
+  }
+  if (!blockedErr.includes("auto_approve") || !blockedErr.includes("permissions.allow")) {
+    throw new Error(`(23a) the error must say what to do about it: ${JSON.stringify(blockedErr)}`);
+  }
+  const blockedDenied = blocked.body.denied_actions as Array<{ action?: string }> | undefined;
+  if (!Array.isArray(blockedDenied) || blockedDenied.length !== 1 || blockedDenied[0]?.action !== "command") {
+    throw new Error(`(23a) the machine-readable denial must be kept: ${JSON.stringify(blockedDenied)}`);
+  }
+  if (!String(blocked.body.notes ?? "").includes("auto-denied")) {
+    throw new Error(`(23a) the CLI's own note must stay in notes: ${JSON.stringify(blocked.body.notes)}`);
+  }
+  if (blocked.body.exit_code !== 0) {
+    throw new Error(`(23a) the CLI's exit code must be reported as it was: ${JSON.stringify(blocked.body.exit_code)}`);
+  }
+  if (blocked.body.response_empty !== undefined) {
+    throw new Error(
+      `(23a) response_empty marks a SUCCESSFUL but silent run - a blocked run carries the error instead: ${JSON.stringify(blocked.body.response_empty)}`
+    );
+  }
+  if (blocked.watch?.status !== "error" || String(blocked.watch?.error ?? "").length === 0) {
+    throw new Error(`(23a) the watch report must carry the same verdict: ${JSON.stringify(blocked.watch)}`);
+  }
+
+  // (23b) A denial WITH a response is still a SUCCESS: the agent worked around
+  //       the denial, so the gate must not fire.
+  const talkedStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-blocked-talked-"));
+  const talked = await delegate(writeFake(DENIED_BUT_TALKED_BODY), talkedStateDir, 804);
+  if (talked.isError !== false) {
+    throw new Error(`(23b) a denial with a response must not be flagged isError: ${JSON.stringify(talked.body)}`);
+  }
+  if (talked.body.status !== "success") {
+    throw new Error(`(23b) a denial with a response must stay a success: ${JSON.stringify(talked.body)}`);
+  }
+  if (talked.body.error !== undefined) {
+    throw new Error(`(23b) a successful run must not carry an error: ${JSON.stringify(talked.body)}`);
+  }
+  if (talked.body.response !== "I could not run the command, but here is what I found.") {
+    throw new Error(`(23b) the response must be kept: ${JSON.stringify(talked.body.response)}`);
+  }
+  if (!Array.isArray(talked.body.denied_actions) || (talked.body.denied_actions as unknown[]).length !== 1) {
+    throw new Error(`(23b) the denial must still be reported: ${JSON.stringify(talked.body.denied_actions)}`);
+  }
+
+  // (23c) An empty response with NO denial is still a SUCCESS (and keeps the
+  //       response_empty marker).
+  const silentStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-blocked-silent-"));
+  const silent = await delegate(writeFake(SILENT_BODY), silentStateDir, 806);
+  if (silent.isError !== false) {
+    throw new Error(`(23c) a silent run must not be flagged isError: ${JSON.stringify(silent.body)}`);
+  }
+  if (silent.body.status !== "success") {
+    throw new Error(`(23c) a silent run must stay a success: ${JSON.stringify(silent.body)}`);
+  }
+  if (silent.body.error !== undefined) {
+    throw new Error(`(23c) a successful run must not carry an error: ${JSON.stringify(silent.body)}`);
+  }
+  if (silent.body.response_empty !== true) {
+    throw new Error(`(23c) a silent success must keep response_empty: ${JSON.stringify(silent.body)}`);
+  }
+
+  // (23d) The quota path is unaffected - and it wins over the blocked gate:
+  //       the classification runs AFTER the quota upgrade.
+  const quotaDeniedStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-blocked-quota-"));
+  const quotaDenied = await delegate(writeFake(QUOTA_DENIED_BODY), quotaDeniedStateDir, 808);
+  if (quotaDenied.isError !== true) {
+    throw new Error(`(23d) a quota failure must be flagged isError: ${JSON.stringify(quotaDenied.body)}`);
+  }
+  if (quotaDenied.body.status !== "quota_error") {
+    throw new Error(`(23d) a quota failure must stay a quota_error: ${JSON.stringify(quotaDenied.body)}`);
+  }
+  if (typeof quotaDenied.body.quota_note !== "string" || quotaDenied.body.quota_note.length === 0) {
+    throw new Error(`(23d) a quota failure must carry quota_note: ${JSON.stringify(quotaDenied.body)}`);
+  }
+  const quotaFailStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-blocked-quotafail-"));
+  const quotaFail = await delegate(writeFake(QUOTA_FAIL_BODY), quotaFailStateDir, 810);
+  if (quotaFail.isError !== true || quotaFail.body.status !== "quota_error") {
+    throw new Error(`(23d) a quota failure must stay a quota_error: ${JSON.stringify(quotaFail.body)}`);
+  }
+  if (typeof quotaFail.body.quota_note !== "string" || quotaFail.body.quota_note.length === 0) {
+    throw new Error(`(23d) a quota failure must carry quota_note: ${JSON.stringify(quotaFail.body)}`);
+  }
+  if (quotaFail.body.error !== "Individual quota reached" || quotaFail.body.exit_code !== 3) {
+    throw new Error(`(23d) the CLI's own message and the exit code must be kept: ${JSON.stringify(quotaFail.body)}`);
+  }
+
+  console.log(
+    "blocked runs: a denied-and-silent run is a failure (isError, status error, the denial and the way out named, the watch report agrees), a denial with a response and a silent success stay successes, and a quota failure stays a quota_error: ok"
   );
 }
 
