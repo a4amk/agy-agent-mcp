@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Breaking changes
+
+The next release is a minor bump (0.3.0) — these change what a caller observes.
+
+- **Unknown argument keys are refused.** A call carrying a key that is not in the tool's `inputSchema` used to be accepted and the key ignored; it is an error now and nothing is spawned. *Migration: send only the keys the tool's `inputSchema` declares.*
+- **Wrong-typed arguments are refused**, including `null` for an optional argument — a mistyped value used to be silently dropped (so `auto_approve: "true"` silently meant **false**). *Migration: omit an optional argument you do not want instead of sending `null` or `""`.*
+- **A failed delegation returns `isError: true`** on the tool result (it used to be `false`, with the failure only in the body). *Migration: read `status` as well as `isError` if you branch on the outcome.*
+- **`error` carries the CLI's own failure message verbatim** instead of the generic `"agy exited with code N"`. *Migration: do not match the old wording; surface the message as-is.*
+- **The single-flight rejection body is the `{"error": "..."}` envelope**, not a plain-text `"MCP error: ..."` block. *Migration: parse the rejection body as JSON.*
+- **A run whose tool requests were all auto-denied and that produced no output is `status: "error"`**, not a `"success"` with an empty response. *Migration: read the error text / `denied_actions` to tell "blocked" from "done".*
+- **A detached (`background: true`) run survives the client disconnect** — the server lingers until the run ends and writes its receipt, instead of killing the run. Every other child is still reaped at the disconnect, and `SIGINT`/`SIGTERM` still kill everything at once. *Migration: the server process now lingers for the duration of a detached run; the run's result is still collectable from any client that can see the state dir.*
+- **A failed `list_models` / `list_agents` answers with the error envelope**, not a `models` / `agents` field. *Migration: handle `isError` on the two discovery tools.*
+- **The watch digest holds at most the 50 most recent steps** (it used to hold every step), while `step_count` keeps reporting the total. *Migration: read `step_count` for the total.*
+
 - added handle-and-watch workflow: detached delegations (background: true), enriched watch_task result retrieval, and detached run cancellation
 - added agy-agent-follow live-follow companion CLI (bin/follow.mjs + src/follow.ts)
 - fixed effort handling: the documented default effort is really applied now (general_task runs at medium, explore_task at low), a tier-carrying model id wins over it (no --effort is passed for it), a conflicting effort is refused locally before anything is spawned, and only low|medium|high are accepted
