@@ -4521,5 +4521,196 @@ const HANDSHAKE = (clientName: string) => ({
   );
 }
 
+// ---------------------------------------------------------------------------
+// 24. An IGNORED cancel is visible: watch_task(cancel: true) on a run this
+//     server process does not own says so in its `hint`
+// ---------------------------------------------------------------------------
+{
+  /** One watch_task call over a driven stdio session. */
+  const watchOverStdio = async (
+    io: McpIo,
+    id: number,
+    args: Record<string, unknown>
+  ): Promise<Record<string, unknown>> => {
+    io.send({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name: "watch_task", arguments: args },
+    });
+    await io.waitUntil(() => !!io.responseFor(id), `watch_task response (id ${id})`);
+    return JSON.parse(contentText(io.responseFor(id), id)) as Record<string, unknown>;
+  };
+
+  // (24a) A cancel for a run ANOTHER server process owns: the request is
+  //       ignored, and the report says so instead of showing a bare
+  //       `running: true` the caller cannot act on.
+  const foreignStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-cancel-foreign-"));
+  // A transcript left behind by another server process: no "== done:" line
+  // and no .ndjson receipt, so the run still reads as running.
+  writeFileSync(
+    path.join(foreignStateDir, "task_foreign01.stream"),
+    ["session open · cwd=/work/foreign · permission_mode=accept-edits · tools=1", "● agent_response", ""].join("\n")
+  );
+  const foreignBody = await (async () => {
+    let body: Record<string, unknown> = {};
+    const { exitCode } = await driveMcpStdio("/bin/true", foreignStateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("cancel-foreign-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
+      body = await watchOverStdio(io, 2, { cancel: true, stream_file: "task_foreign01" });
+    });
+    if (exitCode !== 0) {
+      throw new Error(`(24a) the ignored-cancel suite must exit 0, got ${exitCode}`);
+    }
+    return body;
+  })();
+  if (foreignBody.running !== true) {
+    throw new Error(`(24a) the foreign run must still read as running: ${JSON.stringify(foreignBody)}`);
+  }
+  const foreignHint = foreignBody.hint;
+  if (typeof foreignHint !== "string" || foreignHint.length === 0) {
+    throw new Error(`(24a) an ignored cancel must be visible in the report's hint: ${JSON.stringify(foreignBody)}`);
+  }
+  if (!/ignor/i.test(foreignHint)) {
+    throw new Error(`(24a) the hint must say the cancel was ignored: ${foreignHint}`);
+  }
+  if (!/cancel/i.test(foreignHint)) {
+    throw new Error(`(24a) the hint must name the cancel: ${foreignHint}`);
+  }
+  if (!/another|different|own/i.test(foreignHint)) {
+    throw new Error(
+      `(24a) the hint must say why the cancel was ignored (another process owns the run): ${foreignHint}`
+    );
+  }
+
+  // (24b) A plain watch_task (no cancel) carries no hint, and the ignored
+  //       cancel left the foreign run running.
+  const plainBody = await (async () => {
+    let body: Record<string, unknown> = {};
+    const { exitCode } = await driveMcpStdio("/bin/true", foreignStateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("cancel-plain-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
+      body = await watchOverStdio(io, 2, { stream_file: "task_foreign01" });
+    });
+    if (exitCode !== 0) {
+      throw new Error(`(24b) the plain-watch suite must exit 0, got ${exitCode}`);
+    }
+    return body;
+  })();
+  if (plainBody.hint !== undefined) {
+    throw new Error(`(24b) a watch without a cancel must not carry a hint: ${JSON.stringify(plainBody)}`);
+  }
+  if (plainBody.running !== true) {
+    throw new Error(`(24b) the ignored cancel must not have stopped the foreign run: ${JSON.stringify(plainBody)}`);
+  }
+
+  // (24c) A cancel that WORKS (this process owns the run) must NOT carry the
+  //       hint - the report shows the run stopped, and that is the whole
+  //       story.
+  const ownedAgy = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(
+    ownedAgy,
+    [
+      "#!/bin/sh",
+      `printf '%s\\n' "invoke" >> "$AGY_FAKE_ARGFILE"`,
+      "sleep 30",
+      `printf '%s\\n' '{"event":"result","result":{"conversation_id":"owned-c1","status":"SUCCESS","response":"never reached","duration_seconds":0.2,"num_turns":1}}'`,
+      "",
+    ].join("\n")
+  );
+  chmodSync(ownedAgy, 0o755);
+  const ownedStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-cancel-owned-"));
+  const ownedBody = await (async () => {
+    let body: Record<string, unknown> = {};
+    const { exitCode } = await driveMcpStdio(ownedAgy, ownedStateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("cancel-owned-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
+      io.send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "general_task",
+          arguments: { prompt: "detached run owned by this process", cwd: ownedStateDir, background: true },
+        },
+      });
+      await io.waitUntil(() => !!io.responseFor(2), "background delegation response (id 2)");
+      const handle = JSON.parse(contentText(io.responseFor(2), 2)) as { task_id?: string; status?: string };
+      if (handle.status !== "running" || typeof handle.task_id !== "string") {
+        throw new Error(`(24c) the detached run must start running: ${JSON.stringify(handle)}`);
+      }
+      body = await watchOverStdio(io, 3, { cancel: true, stream_file: handle.task_id });
+    });
+    if (exitCode !== 0) {
+      throw new Error(`(24c) the owned-cancel suite must exit 0, got ${exitCode}`);
+    }
+    return body;
+  })();
+  if (ownedBody.running !== false || ownedBody.finished !== true) {
+    throw new Error(`(24c) a cancel this process owns must stop the run: ${JSON.stringify(ownedBody)}`);
+  }
+  if (ownedBody.hint !== undefined) {
+    throw new Error(`(24c) a cancel that works must not carry the ignored-cancel hint: ${JSON.stringify(ownedBody)}`);
+  }
+
+  // (24d) A cancel for a run that already FINISHED must not carry the hint:
+  //       `finished: true` already says there was nothing to cancel.
+  const doneAgy = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(
+    doneAgy,
+    [
+      "#!/bin/sh",
+      `printf '%s\\n' "invoke" >> "$AGY_FAKE_ARGFILE"`,
+      `printf '%s\\n' '{"event":"result","result":{"conversation_id":"done-c1","status":"SUCCESS","response":"PONG","duration_seconds":0.2,"num_turns":1,"usage":{"total_tokens":10}}}'`,
+      "",
+    ].join("\n")
+  );
+  chmodSync(doneAgy, 0o755);
+  const doneStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-cancel-done-"));
+  const doneBodies = await (async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const { exitCode } = await driveMcpStdio(doneAgy, doneStateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("cancel-done-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
+      io.send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "a run that finishes", cwd: doneStateDir } },
+      });
+      await io.waitUntil(() => !!io.responseFor(2), "delegation response (id 2)");
+      const done = JSON.parse(contentText(io.responseFor(2), 2)) as { task_id?: string; status?: string };
+      if (done.status !== "success" || typeof done.task_id !== "string") {
+        throw new Error(`(24d) the run must succeed: ${JSON.stringify(done)}`);
+      }
+      bodies.push(await watchOverStdio(io, 3, { cancel: true, stream_file: done.task_id }));
+      bodies.push(await watchOverStdio(io, 4, { stream_file: done.task_id }));
+    });
+    if (exitCode !== 0) {
+      throw new Error(`(24d) the finished-run suite must exit 0, got ${exitCode}`);
+    }
+    return bodies;
+  })();
+  if (doneBodies[0].finished !== true) {
+    throw new Error(`(24d) the finished run must read as finished: ${JSON.stringify(doneBodies[0])}`);
+  }
+  if (doneBodies[0].hint !== undefined) {
+    throw new Error(
+      `(24d) a cancel for a finished run must not carry the ignored-cancel hint: ${JSON.stringify(doneBodies[0])}`
+    );
+  }
+  if (doneBodies[1].hint !== undefined) {
+    throw new Error(`(24d) a plain watch of a finished run must not carry a hint: ${JSON.stringify(doneBodies[1])}`);
+  }
+
+  console.log(
+    "ignored cancel: a cancel for a run this process does not own says so in the report's hint (the cancel did nothing, the run is in flight, another process owns it), a cancel that works and a cancel for a finished run carry no hint: ok"
+  );
+}
+
 closeSync(0);
 console.log("=== OFFLINE TESTS PASS ===");
