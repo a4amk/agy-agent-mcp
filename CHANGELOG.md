@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-10-21
 
 ### Breaking changes
 
-The next release is a minor bump (0.3.0) — these change what a caller observes.
+This release is a minor bump: the following change what a caller observes.
 
 - **Unknown argument keys are refused.** A call carrying a key that is not in the tool's `inputSchema` used to be accepted and the key ignored; it is an error now and nothing is spawned. *Migration: send only the keys the tool's `inputSchema` declares.*
 - **Wrong-typed arguments are refused**, including `null` for an optional argument — a mistyped value used to be silently dropped (so `auto_approve: "true"` silently meant **false**). *Migration: omit an optional argument you do not want instead of sending `null` or `""`.*
