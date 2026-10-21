@@ -4,9 +4,10 @@
  * Runs ONE delegation directly through the server's own runner (`runTask` from
  * src/agy.ts — no MCP layer, no JSON-RPC, no subprocess of bin/mcp.mjs) and
  * forwards the live transcript to stdout, so a delegated run can be watched
- * from a terminal while it happens. stdout carries exactly the mirrored
- * `.stream` transcript lines plus the final result JSON; the single meta
- * banner goes to stderr.
+ * from a terminal while it happens. stdout carries the `--- task <id> · stream
+ * <name> ---` banner, then the mirrored `.stream` transcript lines as they are
+ * written, then the `=== task done ===` marker and the final result JSON; the
+ * single meta banner goes to stderr.
  *
  * Model and effort are two separate knobs, exactly as on the MCP tool surface:
  * pass a bare model id together with `--effort` (e.g. `--model
@@ -187,7 +188,9 @@ if (invocation.help) {
   process.stderr.write(USAGE);
   process.exitCode = 2;
 } else {
-  // stderr-only banner keeps stdout clean: exactly transcript lines + result.
+  // stderr-only banner keeps stdout free of meta noise: stdout carries the
+  // task banner, the transcript lines, the "=== task done ===" marker and
+  // the result JSON - nothing else.
   const taskCwd = path.resolve(invocation.cwd ?? process.cwd());
   process.stderr.write(
     `[${FOLLOW_NAME}] tool=${invocation.tool} model=${invocation.model ?? "default"} cwd=${taskCwd}\n`
