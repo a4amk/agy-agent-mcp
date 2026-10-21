@@ -48,7 +48,33 @@ GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci`, `npm run lint`, and `
 
 ## Releasing
 
-- A release is a tag. On `main`, bump the version in `package.json` and the `## <version>` heading in `CHANGELOG.md` **in the same commit** as the release, then push the tag (`git tag v<version> && git push origin v<version>`). The tag push runs `.github/workflows/publish.yml`, which publishes to npm through Trusted Publishing (OIDC, no token) and creates the GitHub release. There is no manual trigger - to retry a failed release, re-run the workflow run of that tag push. npm refuses to publish the same version twice, so a run that failed *after* the publish (the GitHub release step) cannot be re-published: create that release by hand from the tag.
+- A release is a **tag on `main`**. The tag push is what publishes: `.github/workflows/publish.yml` runs on the push of a `v*` tag, publishes the package to npm through Trusted Publishing (OIDC, no token) and creates the GitHub release. There is no manual trigger - to retry a failed release, re-run the workflow run of that tag push. npm refuses to publish the same version twice, so a run that failed *after* the publish (the GitHub release step) cannot be re-published: create that release by hand from the tag.
+- The preparation of a release is **one command**, not three hand-edits:
+
+  ```sh
+  npm run release -- 0.3.0
+  ```
+
+  It does the whole prep in one go and refuses to do it half-way:
+  - **the release notes come first** - the script refuses to run unless `CHANGELOG.md` carries a `## Unreleased` section (and it is not empty): the maintainer writes the notes of the release there *before* running the command, and the release publishes exactly that section;
+  - **the version is validated** as a **stable `MAJOR.MINOR.PATCH`** - three numbers, no leading zero (e.g. `0.3.0`) - and nothing else: no prerelease and no build metadata. A prerelease would need the workflow to publish with `--tag` (npm refuses a prerelease without it) and npm strips build metadata at publish time, so either way the published version would not be the version the tag names. The version in `package.json` is therefore exactly the version npm publishes and exactly the version the tag names; it must also be newer than the current `package.json` version;
+  - **the working tree must be clean** - the script refuses any pre-existing modification, so it always starts from a known state;
+  - it then edits exactly four things: the `version` in `package.json`, the two version fields in `package-lock.json` (the top-level `version` and `packages[""].version` - the lockfile is bumped with the version, or it would claim an older version than the package), the `## Unreleased` heading in `CHANGELOG.md` (renamed to `## <version> - <date>`) and the `serverInfo.version` of the two goldens `test/goldens/initialize.json` and `test/goldens/duplicate-initialize.json`. The goldens are compared exactly by the test suite, so they can no longer drift away from `package.json` (they sat at `0.1.2` through two releases before);
+  - it runs the gates (`npm test` and `npm run lint`) and aborts without committing if either fails;
+  - the whole sequence is **all-or-nothing**: a write error, a signal, a red gate or a failed commit puts the working tree back the way it was, so a failed run never leaves the tree half prepared and never blocks the next run;
+  - it creates the commit `chore(release): <version>` with those files and nothing else.
+- The script **never pushes, never tags and never publishes** (it has no network access at all): it prepares the commit, the maintainer does the rest.
+- The flow, end to end:
+  1. write the release notes under `## Unreleased` in `CHANGELOG.md` and commit them;
+  2. `npm run release -- <version>` - prepares the version bump, the changelog heading and the goldens, runs the gates and creates the `chore(release): <version>` commit;
+  3. push the branch, open a PR into `main` and merge it with **Rebase and merge** (a squash merge would collapse the history; a merge commit is rejected by the linear-history rule);
+  4. on `main`, tag the release and push the tag:
+
+     ```sh
+     git tag v<version> && git push origin v<version>
+     ```
+
+     That tag push runs `.github/workflows/publish.yml`, which publishes to npm through Trusted Publishing (OIDC, no token) and creates the GitHub release.
 - The workflow refuses to publish unless:
   1. **the ref is a release tag** (`refs/tags/v<version>`) - a branch ref, or a tag that is not a version, is refused;
   2. **the tag matches the `package.json` version** (`v0.3.0` publishes `0.3.0` and nothing else) - a mismatch is refused, so a tag can never publish a version other than the one it names;
