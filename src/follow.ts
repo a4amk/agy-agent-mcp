@@ -115,7 +115,11 @@ function parseInvocation(argv: string[]): FollowInvocation {
         if (isEffortLevel(value)) parsed.effort = value;
         else problems.push(`--effort must be one of ${EFFORT_LEVELS.join("|")}, got: ${value}`);
       } else if (arg === "--model") {
-        parsed.model = value;
+        // The model id is trimmed: the agy CLI compares it verbatim, so a
+        // padded id would be an unknown model. The trimmed value is what
+        // reaches the CLI and what the messages below quote.
+        const model = value.trim();
+        parsed.model = model === "" ? undefined : model;
       } else {
         parsed.cwd = value;
       }

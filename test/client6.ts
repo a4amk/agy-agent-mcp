@@ -34,8 +34,9 @@
  *    `@modelcontextprotocol` nor `zod`.
  * 9. Single-flight delegation lock over stdio (bin/mcp.mjs + slow fake agy):
  *    while one general_task runs, a second general_task is rejected
- *    immediately (never queued) with the isError envelope naming the in-flight
- *    task id and stream basename, watch_task still answers mid-run, and
+ *    immediately (never queued) with the house {"error": ...} envelope (one
+ *    key, isError true) naming the in-flight task id and stream path,
+ *    watch_task still answers mid-run, and
  *    exactly ONE fake-agy invocation happened (argfile capture).
  * 10. Progress bridge over stdio: with `_meta.progressToken` a delegation
  *     call receives notifications/progress mirrors of its .stream transcript
@@ -110,6 +111,16 @@
  *     - watch_task and the two list tools are validated the same way;
  *     - a valid call still succeeds afterwards (the single-flight lock was
  *       released by the refusals) and spawns exactly one agy.
+ * 20. Robustness: the id-like arguments are trimmed before they reach the CLI
+ *     and the discovery child is reaped when the client disconnects.
+ *     - a whitespace-padded model / agent / project / conversation_id reach the
+ *       CLI trimmed (the agy CLI compares them verbatim) and the call still
+ *       succeeds; the prompt is NOT trimmed;
+ *     - a whitespace-padded tier-carrying model id plus a conflicting effort is
+ *       refused locally (nothing spawned) and the message quotes the TRIMMED
+ *       id;
+ *     - a hanging `agy models` child is gone after the MCP client disconnects
+ *       (it joins the runner's child registry, so the shutdown reaps it).
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -1483,16 +1494,29 @@ const HANDSHAKE = (clientName: string) => ({
     }
     const msg = contentText(busy, 32);
     rejectionMsg = msg;
+    // The house failure envelope: the body is JSON with a single "error" key,
+    // so a caller that parses it gets a message instead of a parse error.
+    let rejectionBody: { error?: string };
+    try {
+      rejectionBody = JSON.parse(msg) as { error?: string };
+    } catch {
+      throw new Error(`the rejection body must be the JSON house envelope: ${msg}`);
+    }
+    if (Object.keys(rejectionBody).join(",") !== "error") {
+      throw new Error(`the rejection must use the {"error": ...} envelope: ${msg}`);
+    }
+    const rejectionText = String(rejectionBody.error ?? "");
     const streamBase = path.basename(delegation.stream_file);
     if (
-      !msg.includes("another delegation is already running") ||
-      !msg.includes("one agent at a time") ||
-      !msg.includes(delegation.task_id) ||
-      !msg.includes(streamBase)
+      !rejectionText.includes("another delegation is already running") ||
+      !rejectionText.includes("one agent at a time") ||
+      !rejectionText.includes(delegation.task_id) ||
+      !rejectionText.includes(streamBase) ||
+      !rejectionText.includes(delegation.stream_file)
     ) {
       throw new Error(
-        `rejection message must name the in-flight task id + stream basename and the one-agent rule:` +
-          ` task=${delegation.task_id} base=${streamBase} msg=${msg}`
+        `rejection message must name the in-flight task id + stream path and the one-agent rule:` +
+          ` task=${delegation.task_id} base=${streamBase} msg=${rejectionText}`
       );
     }
 
@@ -1520,7 +1544,7 @@ const HANDSHAKE = (clientName: string) => ({
   }
 
   console.log(
-    `single-flight lock: id 32 isError rejection ("${rejectionMsg}") names task + stream, watch_task id 33 found/running mid-run, 1 invocation, EOF exit 0: ok`
+    `single-flight lock: id 32 isError rejection ("${rejectionMsg.replace(/\s+/g, " ")}") uses the house {"error": ...} envelope and names task + stream, watch_task id 33 found/running mid-run, 1 invocation, EOF exit 0: ok`
   );
 }
 
@@ -3812,6 +3836,187 @@ const HANDSHAKE = (clientName: string) => ({
 
   console.log(
     'discovery errors: a failing list_models/list_agents comes back as isError with the house {"error": ...} envelope naming the command and the exit code (the crash output stays inside the message, never as the result), a successful one still answers with the raw output and the parsed model ids: ok'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 20. Robustness: trimmed id arguments + the discovery child is reaped when
+//     the client disconnects
+// ---------------------------------------------------------------------------
+{
+  /** A fake that records one "invoke" marker per real invocation, then its argv. */
+  const TRIM_BODY = [
+    `printf '%s\\n' "invoke" >> "$AGY_FAKE_ARGFILE"`,
+    `printf '%s\\n' "$@" >> "$AGY_FAKE_ARGFILE"`,
+    `printf '%s\\n' '{"event":"init","conversation_id":"trim-c1","init":{"cwd":"/work/trim","tools":[],"permission_mode":"accept-edits"}}'`,
+    `printf '%s\\n' '{"event":"result","result":{"conversation_id":"trim-c1","status":"SUCCESS","response":"trim probe ok","duration_seconds":0.2,"num_turns":1}}'`,
+  ].join("\n");
+  const trimBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  writeFileSync(trimBin, `#!/bin/sh\n${TRIM_BODY}\n`);
+  chmodSync(trimBin, 0o755);
+  const trimState = mkdtempSync(path.join(os.tmpdir(), "agy-trim-"));
+
+  /** The fake's argv log, split into one argv array per real invocation. */
+  const trimInvocations = (): string[][] => {
+    const argfile = path.join(trimState, "argv.txt");
+    if (!existsSync(argfile)) return [];
+    const out: string[][] = [];
+    let current: string[] | null = null;
+    for (const line of readFileSync(argfile, "utf8").split("\n").filter(Boolean)) {
+      if (line === "invoke") {
+        current = [];
+        out.push(current);
+        continue;
+      }
+      current?.push(line);
+    }
+    return out;
+  };
+  const trimFlag = (argv: string[], flag: string): string | undefined => {
+    const i = argv.indexOf(flag);
+    return i < 0 ? undefined : argv[i + 1];
+  };
+
+  const { exitCode: trimExit } = await driveMcpStdio(trimBin, trimState, async (io) => {
+    io.send({ jsonrpc: "2.0", id: 601, method: "initialize", params: HANDSHAKE("trim-probe") });
+    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await io.waitUntil(() => !!io.responseFor(601), "initialize response (id 601)");
+
+    let id = 602;
+    const call = async (name: string, args: Record<string, unknown>) => {
+      id += 1;
+      io.send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+      await io.waitUntil(() => !!io.responseFor(id), `response (id ${id})`);
+      const resp = io.responseFor(id);
+      return {
+        isError: resp?.result?.isError === true,
+        body: JSON.parse(contentText(resp, id)) as Record<string, unknown>,
+      };
+    };
+
+    // (20a) The id-like arguments reach the CLI TRIMMED (the agy CLI compares
+    //      them verbatim), the prompt keeps its whitespace, and the call
+    //      still succeeds.
+    const PROMPT = "  leading whitespace is meaningful  ";
+    const padded = await call("general_task", {
+      prompt: PROMPT,
+      cwd: trimState,
+      model: "  gemini-3.8-flash  ",
+      agent: "  reviewer  ",
+      project: "  proj  ",
+      conversation_id: "  abc  ",
+    });
+    if (padded.isError || padded.body.status !== "success") {
+      throw new Error(`(20a) a padded delegation must still succeed: ${JSON.stringify(padded.body)}`);
+    }
+    const argv = trimInvocations()[0] ?? [];
+    for (const [flag, want] of [
+      ["--model", "gemini-3.8-flash"],
+      ["--agent", "reviewer"],
+      ["--project", "proj"],
+      ["--conversation", "abc"],
+    ] as const) {
+      const got = trimFlag(argv, flag);
+      if (got !== want) {
+        throw new Error(`(20a) ${flag} must reach agy trimmed ("${want}"), got ${JSON.stringify(got)}`);
+      }
+    }
+    if (trimFlag(argv, "-p") !== PROMPT) {
+      throw new Error(`(20a) the prompt must NOT be trimmed: ${JSON.stringify(trimFlag(argv, "-p"))}`);
+    }
+
+    // (20b) A whitespace-padded tier-carrying model id + a conflicting effort
+    //      is refused locally: nothing is spawned and the message quotes the
+    //      TRIMMED id.
+    const before = trimInvocations().length;
+    const conflict = await call("general_task", {
+      prompt: "padded tier conflict probe",
+      cwd: trimState,
+      model: "  gemini-3.8-flash-high  ",
+      effort: "medium",
+    });
+    if (conflict.isError !== true) {
+      throw new Error(
+        `(20b) a padded tier id + a conflicting effort must be refused: ${JSON.stringify(conflict.body)}`
+      );
+    }
+    if (Object.keys(conflict.body).join(",") !== "error") {
+      throw new Error(`(20b) the local error must use the {"error": ...} envelope: ${JSON.stringify(conflict.body)}`);
+    }
+    const conflictMsg = String(conflict.body.error ?? "");
+    if (!conflictMsg.includes('"gemini-3.8-flash-high"')) {
+      throw new Error(`(20b) the conflict message must quote the trimmed model id: ${conflictMsg}`);
+    }
+    if (conflictMsg.includes("  gemini-3.8-flash-high  ")) {
+      throw new Error(`(20b) the conflict message must not quote the padded model id: ${conflictMsg}`);
+    }
+    if (!/conflict/i.test(conflictMsg)) {
+      throw new Error(`(20b) the conflict message must say what conflicts: ${conflictMsg}`);
+    }
+    if (trimInvocations().length !== before) {
+      throw new Error(`(20b) a padded tier conflict must spawn nothing (${trimInvocations().length} invocations)`);
+    }
+  });
+  if (trimExit !== 0) {
+    throw new Error(`the trimmed-argument suite must exit 0, got ${trimExit}`);
+  }
+
+  // (20c) A HANGING discovery command is reaped when the MCP client
+  //      disconnects: the discovery child joins the runner's child registry,
+  //      so the shutdown kills it instead of orphaning it.
+  {
+    const hangDir = mkdtempSync(path.join(os.tmpdir(), "agy-discovery-hang-"));
+    const pidfile = path.join(hangDir, "pid.txt");
+    const hangBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+    // The fake records its own pid and then hangs forever.
+    writeFileSync(hangBin, `#!/bin/sh\necho $$ > ${JSON.stringify(pidfile)}\nexec sleep 30\n`);
+    chmodSync(hangBin, 0o755);
+    const hangState = mkdtempSync(path.join(os.tmpdir(), "agy-discovery-hang-state-"));
+
+    const { exitCode: hangExit } = await driveMcpStdio(hangBin, hangState, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 610, method: "initialize", params: HANDSHAKE("discovery-hang-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(610), "initialize response (id 610)");
+      io.send({
+        jsonrpc: "2.0",
+        id: 611,
+        method: "tools/call",
+        params: { name: "list_models", arguments: {} },
+      });
+      // The discovery command hangs: wait until the child is really up, then
+      // let the client go away (driveMcpStdio ends stdin on return).
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(pidfile) && Date.now() < deadline) await sleep(20);
+      if (!existsSync(pidfile)) {
+        throw new Error("(20c) the discovery child must have been spawned");
+      }
+    });
+    if (hangExit !== 0) {
+      throw new Error(`(20c) the server must exit cleanly when the client disconnects, got ${hangExit}`);
+    }
+    const pid = Number(readFileSync(pidfile, "utf8").trim());
+    const pidAlive = (p: number): boolean => {
+      try {
+        process.kill(p, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+      }
+    };
+    let alive = pidAlive(pid);
+    const reapDeadline = Date.now() + 5_000;
+    while (alive && Date.now() < reapDeadline) {
+      await sleep(50);
+      alive = pidAlive(pid);
+    }
+    if (alive) {
+      throw new Error(`(20c) the discovery child must be reaped when the client disconnects (pid ${pid})`);
+    }
+    rmSync(hangDir, { recursive: true, force: true });
+  }
+
+  console.log(
+    "trimmed arguments: a padded model/agent/project/conversation_id reach agy trimmed (the prompt is not trimmed) and the call succeeds, a padded tier id + a conflicting effort is refused locally with the trimmed id in the message and 0 spawns, and a hanging discovery child is reaped when the client disconnects: ok"
   );
 }
 
