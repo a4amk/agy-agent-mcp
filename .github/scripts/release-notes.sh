@@ -34,12 +34,16 @@ version="${tag#v}"
 [ -f "$CHANGELOG" ] || fail "the changelog '${CHANGELOG}' does not exist"
 
 # The section of the released version: from its "## <version>" heading up to
-# the next "## " heading (or the end of the file). The heading may carry a "v".
+# the next "## " heading (or the end of the file). The heading may carry a
+# leading "v" and a date ("## 0.3.0 - 2026-10-21"); only the version token
+# is matched.
 section="$(awk -v want="$version" '
   /^## / {
     heading = substr($0, 4)
-    sub(/^v/, "", heading)
-    if (heading == want) { printing = 1; print $0; next }
+    split(heading, parts, /[ \t]+/)
+    version = parts[1]
+    sub(/^v/, "", version)
+    if (version == want) { printing = 1; print $0; next }
     printing = 0
     next
   }
