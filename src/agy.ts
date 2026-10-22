@@ -164,29 +164,53 @@ export interface Task {
 }
 
 export interface TaskResult {
+  /** Unique task identifier (`task_<8-hex-chars>`), naming the transcript files in state dir. */
   task_id: string;
+  /** Terminal execution status: `"success"`, `"error"`, `"timeout"`, or `"quota_error"`. */
   status: TaskStatus;
+  /** Whether `--dangerously-skip-permissions` was applied to this run. */
   auto_approve_applied: boolean;
+  /** Echoed OpenCode session ID (`ses_...`) when provided in request `_meta`. */
   opencode_session_id?: string;
+  /** Resumable Antigravity conversation UUID reported by CLI; pass to resume thread. */
   conversation_id?: string;
+  /** Echoed task prompt, truncated to 200 characters (`…[truncated N chars]`) if longer. */
   prompt: string;
+  /** Resolved working directory where the sub-agent executed. */
   cwd: string;
+  /** Final response text, truncated to the last 20,000 characters (`MAX_RESPONSE_CHARS`). */
   response: string;
+  /** Present and `true` when response was truncated to the last 20,000 characters. */
   response_truncated?: true;
+  /** Duration in seconds from CLI result event, falling back to measured wall-clock seconds. */
   duration_seconds?: number;
+  /** Total number of interaction turns completed by the agent, when reported by CLI. */
   num_turns?: number;
+  /** Token usage statistics when reported by the CLI result event. */
   usage?: Record<string, unknown>;
+  /** Tool actions auto-denied by headless mode because they required prompting. */
   denied_actions?: unknown[];
+  /** Process exit code (0 on clean exit, non-zero on failure, null if signalled). */
   exit_code?: number | null;
+  /** Error explanation for non-success runs (except quota-only overrides with quota_note). */
   error?: string;
+  /** Non-JSON stdout and stderr lines, capped at 4,000 characters (`MAX_NOTES_CHARS`). */
   notes?: string;
+  /** Absolute path to the machine-readable `.ndjson` transcript log in state dir. */
   transcript_file: string;
+  /** Absolute path to the human-readable `.stream` transcript mirror in state dir. */
   stream_file: string;
+  /** Git porcelain diff of modified/created files (capped at 50); git repos only. Shared tree adds audit_note. */
   files_touched?: string[];
+  /** Touched files outside requested edit_scope (capped at 50); git repos with edit_scope only. */
   scope_violations?: string[];
+  /** Advisory note attached on quota/rate-limit failure advising user notification. */
   quota_note?: string;
+  /** Present and `true` on silent success (status success with empty response and no auto-denials). */
   response_empty?: true;
+  /** Explanatory note attached when response_empty is true. */
   response_empty_note?: string;
+  /** Guidance note on how to resume this conversation using conversation_id. */
   resume_hint?: string;
   /**
    * Present when the client opted into progress (a _meta.progressToken was
