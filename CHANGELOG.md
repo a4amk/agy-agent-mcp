@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Added `watch_task(wait: true)` to collect a run in one call**: opt-in parameter that awaits settlement of a detached (`background: true`) run and returns its complete final result in a single call without polling round trips.
+- `watch_task(wait: true)` returns immediately on an already finished run, awaits in-flight runs owned by this process via the delegations registry, and refuses runs in flight owned by another server process with an informative error envelope directing callers to poll.
+- `watch_task` refuses the combination of `cancel: true` and `wait: true` as contradictory and redundant.
+- `watch_task` input schema adds the optional `wait` boolean parameter.
+
 - **Concurrent delegations are now allowed**: any number of `general_task` and `explore_task` calls may run concurrently; a second delegation is no longer refused (`another delegation is already running` is removed).
 - Each concurrent run executes as an independent child process with its own transcript file and final result.
 - `watch_task(cancel: true)` now acts on the run named by the caller via `stream_file` or task ID; cancelling without `stream_file` when multiple runs are in flight is safely ignored with an ambiguity hint.

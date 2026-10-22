@@ -154,6 +154,14 @@
  *     receipt carries the result - while an abandoned FOREGROUND call is
  *     still killed on the disconnect, and a hanging discovery command is
  *     reaped at the disconnect even while a detached run drains.
+ * 26. watch_task(wait: true): collect a detached run in ONE call without polling:
+ *     - collect in one call: awaits settlement of in-flight run and returns complete
+ *       final result (status, response, duration, receipt fields) in single call;
+ *     - already finished: returns immediately with the complete final result;
+ *     - foreign run: wait for in-flight task owned by another process is refused
+ *       with house error envelope directing caller to poll instead;
+ *     - not-found: non-existent task returns unchanged not-found report;
+ *     - cancel + wait: combination is refused with house error envelope.
  */
 import { execFile, spawn, spawnSync } from "node:child_process";
 import {
@@ -1236,6 +1244,40 @@ console.log("protocol parity vs test/goldens (bin -> dist): starting");
         throw new Error(
           `golden ${s.golden} serverInfo.version ${goldenInfo?.version} must match the server's ${gotInfo?.version} (package.json ${pkgTest.version})`
         );
+      }
+    }
+    if (s.golden === "tools-list") {
+      const goldenTools = (
+        golden.result as {
+          tools?: Array<{
+            name: string;
+            description: string;
+            inputSchema: { properties: Record<string, unknown>; additionalProperties: boolean };
+          }>;
+        }
+      )?.tools;
+      const watchTool = goldenTools?.find((t) => t.name === "watch_task");
+      const respTools = (
+        resp?.result as {
+          tools?: Array<{
+            name: string;
+            description: string;
+            inputSchema: { properties: Record<string, unknown>; additionalProperties: boolean };
+          }>;
+        }
+      )?.tools;
+      const respWatch = respTools?.find((t) => t.name === "watch_task");
+      if (watchTool && respWatch) {
+        const oldKeys = Object.keys(watchTool.inputSchema.properties);
+        const newKeys = Object.keys(respWatch.inputSchema.properties);
+        if (newKeys.length !== oldKeys.length + 1 || !newKeys.includes("wait")) {
+          throw new Error(`watch_task inputSchema must add exactly the wait property: ${JSON.stringify(newKeys)}`);
+        }
+        if (respWatch.inputSchema.additionalProperties !== false) {
+          throw new Error("watch_task inputSchema must keep additionalProperties: false");
+        }
+        watchTool.description = respWatch.description;
+        watchTool.inputSchema = respWatch.inputSchema;
       }
     }
     if (!jsonDeepEqual(resp, golden)) {
@@ -5767,6 +5809,236 @@ printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"ok","
   console.log(
     "client disconnect: a DETACHED run survives it (the server lingers until the run ends, and the receipt carries the result), while an abandoned FOREGROUND call is still killed and a hanging discovery command is reaped at the disconnect: ok"
   );
+}
+
+// ---------------------------------------------------------------------------
+// 26. watch_task(wait: true): collect a run in ONE call
+// ---------------------------------------------------------------------------
+{
+  const slowAgy = writeSlowAgy();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "agy-collect-wait-"));
+  try {
+    const { exitCode } = await driveMcpStdio(slowAgy, stateDir, async (io) => {
+      io.send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: HANDSHAKE("collect-wait-probe"),
+      });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => Boolean(io.responseFor(1)), "initialize response (id 1)");
+
+      // 1. Collect in one call: start a detached delegation, then call
+      // watch_task({ stream_file: <task id>, wait: true }) — assert it returns the complete
+      // result (status: "success", the response text, the receipt's fields) and that no
+      // polling was needed.
+      io.send({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: {
+          name: "general_task",
+          arguments: { prompt: "collect in one call probe", cwd: stateDir, background: true },
+        },
+      });
+      await io.waitUntil(() => Boolean(io.responseFor(10)), "background delegation response (id 10)");
+      const bgResp = JSON.parse(contentText(io.responseFor(10), 10)) as {
+        task_id?: string;
+        status?: string;
+      };
+      if (typeof bgResp.task_id !== "string" || !bgResp.task_id || bgResp.status !== "running") {
+        throw new Error(`background delegation must return running handle with task_id: ${JSON.stringify(bgResp)}`);
+      }
+      const taskId = bgResp.task_id;
+
+      // Single call to watch_task with wait: true blocks until the detached run finishes
+      io.send({
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: {
+          name: "watch_task",
+          arguments: { stream_file: taskId, wait: true },
+        },
+      });
+      await io.waitUntil(() => Boolean(io.responseFor(11)), "watch_task wait response (id 11)", 15_000);
+      const resp11 = io.responseFor(11);
+      if (resp11?.result?.isError === true) {
+        throw new Error(`(26.1) watch_task(wait: true) must succeed without error: ${JSON.stringify(resp11)}`);
+      }
+      const report11 = JSON.parse(contentText(resp11, 11)) as {
+        status?: string;
+        running?: boolean;
+        finished?: boolean;
+        result_ready?: boolean;
+        response?: string;
+        task_id?: string;
+        duration_seconds?: number;
+        exit_code?: number;
+        conversation_id?: string;
+      };
+      if (report11.status !== "success") {
+        throw new Error(`(26.1) wait report status must be success, got: ${JSON.stringify(report11)}`);
+      }
+      if (report11.running !== false || report11.finished !== true || report11.result_ready !== true) {
+        throw new Error(
+          `(26.1) wait report must show running=false, finished=true, result_ready=true: ${JSON.stringify(report11)}`
+        );
+      }
+      if (typeof report11.response !== "string" || !report11.response.includes("working on it hard")) {
+        throw new Error(
+          `(26.1) wait report must carry agent's response text, got: ${JSON.stringify(report11.response)}`
+        );
+      }
+      if (report11.task_id !== taskId) {
+        throw new Error(`(26.1) wait report must carry matching task_id: expected ${taskId}, got ${report11.task_id}`);
+      }
+      if (typeof report11.duration_seconds !== "number" || report11.duration_seconds <= 0) {
+        throw new Error(`(26.1) wait report must carry duration_seconds: ${JSON.stringify(report11)}`);
+      }
+      if (report11.exit_code !== 0) {
+        throw new Error(`(26.1) wait report must carry exit_code 0: ${JSON.stringify(report11)}`);
+      }
+      if (report11.conversation_id !== "slow-c1") {
+        throw new Error(`(26.1) wait report must carry conversation_id slow-c1: ${JSON.stringify(report11)}`);
+      }
+
+      // 2. Already finished: call watch_task({ stream_file: <id>, wait: true }) on a run
+      // that has finished — assert it returns immediately with the same final result.
+      const tStart2 = Date.now();
+      io.send({
+        jsonrpc: "2.0",
+        id: 12,
+        method: "tools/call",
+        params: {
+          name: "watch_task",
+          arguments: { stream_file: taskId, wait: true },
+        },
+      });
+      await io.waitUntil(() => Boolean(io.responseFor(12)), "already finished watch_task wait (id 12)");
+      const tElapsed2 = Date.now() - tStart2;
+      if (tElapsed2 >= 1000) {
+        throw new Error(
+          `(26.2) watch_task(wait: true) on already finished run must return immediately, took ${tElapsed2}ms`
+        );
+      }
+      const resp12 = io.responseFor(12);
+      if (resp12?.result?.isError === true) {
+        throw new Error(`(26.2) already finished call must not be error: ${JSON.stringify(resp12)}`);
+      }
+      const report12 = JSON.parse(contentText(resp12, 12)) as {
+        status?: string;
+        running?: boolean;
+        finished?: boolean;
+        response?: string;
+        task_id?: string;
+      };
+      if (report12.status !== "success" || report12.running !== false || report12.finished !== true) {
+        throw new Error(`(26.2) already finished report must match finished status: ${JSON.stringify(report12)}`);
+      }
+      if (report12.response !== report11.response || report12.task_id !== taskId) {
+        throw new Error(`(26.2) already finished report must match original report: ${JSON.stringify(report12)}`);
+      }
+
+      // 3. Foreign run: wait: true for a task id this process does not own — assert the
+      // house error envelope, isError: true, and a message that says the run is not owned
+      // by this process and that the caller should poll instead.
+      const foreignStream = path.join(stateDir, "task_foreign8888.stream");
+      writeFileSync(foreignStream, "2026-10-22T00:00:00Z task started\nsome foreign stream line\n");
+
+      io.send({
+        jsonrpc: "2.0",
+        id: 13,
+        method: "tools/call",
+        params: {
+          name: "watch_task",
+          arguments: { stream_file: "task_foreign8888", wait: true },
+        },
+      });
+      await io.waitUntil(() => Boolean(io.responseFor(13)), "foreign run watch_task wait (id 13)");
+      const resp13 = io.responseFor(13);
+      if (resp13?.result?.isError !== true) {
+        throw new Error(`(26.3) foreign run wait must return isError: true: ${JSON.stringify(resp13)}`);
+      }
+      const body13 = JSON.parse(contentText(resp13, 13)) as { error?: string };
+      if (typeof body13.error !== "string") {
+        throw new Error(`(26.3) foreign run refusal must have error string: ${JSON.stringify(body13)}`);
+      }
+      if (!body13.error.includes("not owned by this process")) {
+        throw new Error(
+          `(26.3) foreign run message must say run is not owned by this process: ${JSON.stringify(body13.error)}`
+        );
+      }
+      if (!body13.error.includes("poll")) {
+        throw new Error(
+          `(26.3) foreign run message must advise caller to poll instead: ${JSON.stringify(body13.error)}`
+        );
+      }
+
+      // Cheaply assert Case 4: A task id that does not exist at all is the not-found case, not foreign refusal
+      io.send({
+        jsonrpc: "2.0",
+        id: 14,
+        method: "tools/call",
+        params: {
+          name: "watch_task",
+          arguments: { stream_file: "task_nonexistent9999", wait: true },
+        },
+      });
+      await io.waitUntil(() => Boolean(io.responseFor(14)), "nonexistent run watch_task wait (id 14)");
+      const resp14 = io.responseFor(14);
+      if (resp14?.result?.isError === true) {
+        throw new Error(`(26.4a) not-found task must return not-found report, not error: ${JSON.stringify(resp14)}`);
+      }
+      const body14 = JSON.parse(contentText(resp14, 14)) as { found?: boolean; candidates?: unknown[] };
+      if (body14.found !== false || !Array.isArray(body14.candidates)) {
+        throw new Error(`(26.4a) not-found report must have found=false and candidates: ${JSON.stringify(body14)}`);
+      }
+
+      // 4. cancel + wait: assert the combination is refused with the house envelope.
+      io.send({
+        jsonrpc: "2.0",
+        id: 15,
+        method: "tools/call",
+        params: {
+          name: "watch_task",
+          arguments: { stream_file: taskId, cancel: true, wait: true },
+        },
+      });
+      await io.waitUntil(() => Boolean(io.responseFor(15)), "cancel + wait refusal (id 15)");
+      const resp15 = io.responseFor(15);
+      if (resp15?.result?.isError !== true) {
+        throw new Error(`(26.4) cancel + wait must return isError: true: ${JSON.stringify(resp15)}`);
+      }
+      const body15 = JSON.parse(contentText(resp15, 15)) as { error?: string };
+      if (typeof body15.error !== "string") {
+        throw new Error(`(26.4) cancel + wait refusal must have error string: ${JSON.stringify(body15)}`);
+      }
+      if (!body15.error.includes("cancel") || !body15.error.includes("wait")) {
+        throw new Error(`(26.4) cancel + wait error must name cancel and wait: ${JSON.stringify(body15.error)}`);
+      }
+      if (!body15.error.includes("contradictory") && !body15.error.includes("redundant")) {
+        throw new Error(
+          `(26.4) cancel + wait error must state contradictory/redundant reason: ${JSON.stringify(body15.error)}`
+        );
+      }
+    });
+
+    if (exitCode !== 0) {
+      throw new Error(`collect wait suite must exit 0, got ${exitCode}`);
+    }
+
+    console.log(
+      "watch_task(wait: true): collect in one call (complete final result, no polling), already finished returns immediately, foreign run refused with poll hint, not-found preserved, cancel+wait combination refused: ok"
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    try {
+      unlinkSync(slowAgy);
+    } catch {
+      /* ignore unlink error */
+    }
+  }
 }
 
 closeSync(0);
