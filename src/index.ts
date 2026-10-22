@@ -31,6 +31,7 @@ import {
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_PRINT_TIMEOUT_MS,
   type EffortLevel,
+  listStreamFiles,
   modelTier,
   parseModelIds,
   RETENTION_DAYS,
@@ -212,6 +213,11 @@ const WATCH_INPUT_SCHEMA: Schema = {
       type: "boolean",
       description:
         "When true and the watched task is still running, stop that run immediately (kill the child process, release the delegation lock, and report the run as cancelled).",
+    },
+    wait: {
+      type: "boolean",
+      description:
+        "When true, wait for the named run to finish and return its complete final result in one call. Opt-in; without it watch_task answers immediately. Cannot be combined with cancel: true, and cannot await a run owned by another server process.",
     },
   },
   additionalProperties: false,
@@ -846,6 +852,12 @@ const CANCEL_AMBIGUOUS_HINT =
   "The cancel request was IGNORED: several delegations are in flight (target is ambiguous) - " +
   "pass stream_file to name the run to cancel.";
 
+const WAIT_FOREIGN_RUN_ERROR =
+  "The run is not owned by this process so its completion cannot be awaited here; poll watch_task without wait instead.";
+
+const CANCEL_WAIT_CONFLICT_ERROR =
+  "Cannot combine cancel: true and wait: true: cancelling already awaits the target's settlement, so the two together are contradictory and redundant.";
+
 const TOOLS: ToolSpec[] = [
   {
     name: "general_task",
@@ -898,8 +910,9 @@ const TOOLS: ToolSpec[] = [
     description:
       "Tails a task's live stream transcript. No args = latest run. Call it while a general_task/explore_task " +
       "is in flight (this or any session) to watch the sub-agent work; it is also the progress channel for a " +
-      "detached (background: true) run, which never emits notifications/progress. The returned 'running' field " +
-      "plus " +
+      "detached (background: true) run, which never emits notifications/progress. Pass wait: true to block until " +
+      "the run finishes and return its complete result in one call (cannot await a run owned by another server process). " +
+      "The returned 'running' field plus " +
       "'modified' tell a live run from an abandoned one. For a live feed prefer the compact digest: 'steps' " +
       "(a bounded window over the 50 MOST RECENT steps, oldest first - one entry per read/write/run/phase " +
       "with its target, duration and token cost), 'step_count' (the TOTAL number of steps, so " +
@@ -920,6 +933,47 @@ const TOOLS: ToolSpec[] = [
         const streamFile = stringArg(args, "stream_file");
         const tailLines = intArg(args, "tail_lines", 0, 2000);
         const cancel = boolArg(args, "cancel") ?? false;
+        const wait = boolArg(args, "wait") ?? false;
+
+        if (cancel && wait) {
+          return textResult({ error: CANCEL_WAIT_CONFLICT_ERROR }, true);
+        }
+
+        let targetEntry: ActiveDelegation | undefined;
+        if (wait) {
+          let targetStreamPath: string | undefined;
+          if (streamFile) {
+            const resolved = resolveStreamFile(STATE_DIR, streamFile);
+            if ("error" in resolved) throw new Error(resolved.error);
+            targetStreamPath = resolved.path;
+          } else {
+            const candidates = listStreamFiles(STATE_DIR);
+            if (candidates.length > 0) {
+              targetStreamPath = path.join(STATE_DIR, candidates[0]);
+            }
+          }
+
+          if (targetStreamPath) {
+            for (const d of delegations.values()) {
+              if (
+                d.streamPath === targetStreamPath ||
+                d.taskId === streamFile ||
+                (d.taskId && targetStreamPath.includes(d.taskId))
+              ) {
+                targetEntry = d;
+                break;
+              }
+            }
+            if (targetEntry?.promise) {
+              try {
+                await targetEntry.promise;
+              } catch {
+                /* detached run failure is captured in the receipt on disk */
+              }
+            }
+          }
+        }
+
         // A cancel this process cannot honour must be VISIBLE. The cancel path
         // acts on the in-flight delegations THIS process owns — so a run started
         // by another server process is out of reach, and multiple runs without a
@@ -983,13 +1037,19 @@ const TOOLS: ToolSpec[] = [
         }
         // F3: When the cancel resolved a target and the caller passed no stream_file,
         // watch the target's transcript (target.streamPath).
-        const watchStreamTarget = !streamFile && target?.streamPath ? target.streamPath : streamFile;
+        const watchStreamTarget =
+          !streamFile && (target?.streamPath ?? targetEntry?.streamPath)
+            ? (target?.streamPath ?? targetEntry?.streamPath)
+            : streamFile;
         // The cancel path above already acted on the in-flight delegation;
         // watchTask only reads the transcript (it has no cancel option).
         const report = watchTask({
           streamFile: watchStreamTarget,
           tailLines,
         });
+        if (wait && report.running === true) {
+          return textResult({ error: WAIT_FOREIGN_RUN_ERROR }, true);
+        }
         // F6: The ambiguous-cancel hint is always attached when the cancel was ignored
         // for ambiguity (the delegations are still in flight by definition).
         // For the not-owned-by-this-process hint, keep the existing running gate.
