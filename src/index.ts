@@ -212,7 +212,7 @@ const WATCH_INPUT_SCHEMA: Schema = {
     cancel: {
       type: "boolean",
       description:
-        "When true and the watched task is still running, stop that run immediately (kill the child process, release the delegation lock, and report the run as cancelled).",
+        "When true and the watched task is still running, stop that run immediately (kill the child process and report the run as cancelled).",
     },
     wait: {
       type: "boolean",
@@ -908,7 +908,7 @@ const TOOLS: ToolSpec[] = [
     name: "watch_task",
     title: "Watch live or recent task stream transcript",
     description:
-      "Tails a task's live stream transcript. No args = latest run. Call it while a general_task/explore_task " +
+      "Reads the current tail of a task's live stream transcript (a snapshot, not a follow). No args = latest run. Call it while a general_task/explore_task " +
       "is in flight (this or any session) to watch the sub-agent work; it is also the progress channel for a " +
       "detached (background: true) run, which never emits notifications/progress. Pass wait: true to block until " +
       "the run finishes and return its complete result in one call (cannot await a run owned by another server process). " +
