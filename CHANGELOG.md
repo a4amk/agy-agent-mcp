@@ -6,6 +6,10 @@
 - Each concurrent run executes as an independent child process with its own transcript file and final result.
 - `watch_task(cancel: true)` now acts on the run named by the caller via `stream_file` or task ID; cancelling without `stream_file` when multiple runs are in flight is safely ignored with an ambiguity hint.
 - The shutdown drain now awaits every in-flight detached (`background: true`) run on client disconnect so every receipt is written.
+- Concurrent delegations sharing a working tree in a git repository now carry an `audit_note` explaining that `files_touched` and `scope_violations` may reflect changes from other concurrent runs.
+- Cancelling a detached run via `notifications/cancelled` no longer removes its registry entry before the child settles, ensuring the cancellation receipt is written even if the client disconnects immediately.
+- `watch_task(cancel: true)` without a `stream_file` when exactly one delegation is in flight now returns the report for the cancelled delegation rather than resolving the newest transcript by file modification time.
+- The ambiguity hint for `watch_task(cancel: true)` when multiple delegations are in flight is now always attached even if the transcript resolved by `watch_task` was already finished.
 
 
 ## 0.3.0 - 2026-10-21

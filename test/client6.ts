@@ -1484,459 +1484,958 @@ const HANDSHAKE = (clientName: string) => ({
     }
     return val;
   };
-  const { exitCode } = await driveMcpStdio(slowAgy, stateDir, async (io) => {
-    io.send({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: HANDSHAKE("concurrency-probe"),
-    });
-    io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
-    await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
-
-    type TaskResultPayload = {
-      status?: string;
-      task_id?: string;
-      stream_file?: string;
-      prompt?: string;
-      [k: string]: unknown;
-    };
-
-    // 1 & 2 & 4: Three concurrent delegations all succeed, no cross-contamination, watch_task answers mid-run
-    io.send({
-      jsonrpc: "2.0",
-      id: 10,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "prompt-alpha-10", cwd: stateDir } },
-    });
-    io.send({
-      jsonrpc: "2.0",
-      id: 11,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "prompt-beta-11", cwd: stateDir } },
-    });
-    io.send({
-      jsonrpc: "2.0",
-      id: 12,
-      method: "tools/call",
-      params: { name: "explore_task", arguments: { prompt: "prompt-gamma-12", cwd: stateDir } },
-    });
-
-    // 4. watch_task still answers mid-run
-    io.send({ jsonrpc: "2.0", id: 13, method: "tools/call", params: { name: "watch_task", arguments: {} } });
-    await io.waitUntil(() => !!io.responseFor(13), "watch mid-run response (id 13)");
-    const watch13 = JSON.parse(contentText(io.responseFor(13), 13)) as {
-      found?: boolean;
-      running?: boolean;
-      finished?: boolean;
-    };
-    if (watch13.found !== true || watch13.running !== true || watch13.finished !== false) {
-      throw new Error(`(9.4) watch_task must answer found/running info mid-run, got: ${JSON.stringify(watch13)}`);
-    }
-
-    // Wait for all three delegations to complete
-    await io.waitUntil(
-      () => !!io.responseFor(10) && !!io.responseFor(11) && !!io.responseFor(12),
-      "three concurrent delegations (ids 10, 11, 12)"
-    );
-
-    const resp10 = io.responseFor(10);
-    const resp11 = io.responseFor(11);
-    const resp12 = io.responseFor(12);
-
-    if (resp10?.result?.isError !== false || resp11?.result?.isError !== false || resp12?.result?.isError !== false) {
-      throw new Error(
-        "(9.1) all three concurrent delegations must answer isError: false, got: " +
-          `10=${JSON.stringify(resp10?.result?.isError)}, 11=${JSON.stringify(resp11?.result?.isError)}, 12=${JSON.stringify(resp12?.result?.isError)}`
-      );
-    }
-
-    const body10 = JSON.parse(contentText(resp10, 10)) as TaskResultPayload;
-    const body11 = JSON.parse(contentText(resp11, 11)) as TaskResultPayload;
-    const body12 = JSON.parse(contentText(resp12, 12)) as TaskResultPayload;
-
-    if (body10.status !== "success" || body11.status !== "success" || body12.status !== "success") {
-      throw new Error(
-        `(9.1) all three must have status "success", got: 10=${body10.status}, 11=${body11.status}, 12=${body12.status}`
-      );
-    }
-
-    const taskIds = [body10.task_id, body11.task_id, body12.task_id];
-    for (const tid of taskIds) {
-      if (typeof tid !== "string" || !tid.startsWith("task_")) {
-        throw new Error(`(9.1) invalid task_id in results: ${JSON.stringify(taskIds)}`);
-      }
-    }
-    if (new Set(taskIds).size !== 3) {
-      throw new Error(`(9.1) three distinct task_ids required, got: ${JSON.stringify(taskIds)}`);
-    }
-
-    const streamFiles = [body10.stream_file, body11.stream_file, body12.stream_file];
-    for (const sf of streamFiles) {
-      if (typeof sf !== "string" || !sf.endsWith(".stream")) {
-        throw new Error(`(9.1) invalid stream_file in results: ${JSON.stringify(streamFiles)}`);
-      }
-    }
-    if (new Set(streamFiles).size !== 3) {
-      throw new Error(`(9.1) three distinct stream_files required, got: ${JSON.stringify(streamFiles)}`);
-    }
-
-    // Check invocations in argfile so far: must be exactly 3
-    const invocations1 = readFileSync(argfile, "utf8")
-      .split("\n")
-      .filter((l) => l === "invoke").length;
-    if (invocations1 !== 3) {
-      throw new Error(`(9.1) fake agy must have been invoked exactly 3 times for 3 delegations, got ${invocations1}`);
-    }
-
-    // 2. No cross-contamination: prompt echoes match and no result carries another call's task_id / stream_file
-    if (
-      body10.prompt !== "prompt-alpha-10" ||
-      body11.prompt !== "prompt-beta-11" ||
-      body12.prompt !== "prompt-gamma-12"
-    ) {
-      throw new Error(
-        `(9.2) prompt echoes must match sent prompts: 10=${body10.prompt}, 11=${body11.prompt}, 12=${body12.prompt}`
-      );
-    }
-
-    const raw10 = JSON.stringify(body10);
-    const raw11 = JSON.stringify(body11);
-    const raw12 = JSON.stringify(body12);
-
-    const id10 = requireString(body10.task_id, "body10.task_id");
-    const id11 = requireString(body11.task_id, "body11.task_id");
-    const id12 = requireString(body12.task_id, "body12.task_id");
-
-    const sf10 = requireString(body10.stream_file, "body10.stream_file");
-    const sf11 = requireString(body11.stream_file, "body11.stream_file");
-    const sf12 = requireString(body12.stream_file, "body12.stream_file");
-
-    if (raw10.includes(id11) || raw10.includes(id12)) {
-      throw new Error(`(9.2) body10 cross-contaminated with other task_id: ${raw10}`);
-    }
-    if (raw11.includes(id10) || raw11.includes(id12)) {
-      throw new Error(`(9.2) body11 cross-contaminated with other task_id: ${raw11}`);
-    }
-    if (raw12.includes(id10) || raw12.includes(id11)) {
-      throw new Error(`(9.2) body12 cross-contaminated with other task_id: ${raw12}`);
-    }
-
-    const streamBase10 = path.basename(sf10);
-    const streamBase11 = path.basename(sf11);
-    const streamBase12 = path.basename(sf12);
-
-    if (raw10.includes(streamBase11) || raw10.includes(streamBase12)) {
-      throw new Error(`(9.2) body10 cross-contaminated with other stream_file: ${raw10}`);
-    }
-    if (raw11.includes(streamBase10) || raw11.includes(streamBase12)) {
-      throw new Error(`(9.2) body11 cross-contaminated with other stream_file: ${raw11}`);
-    }
-    if (raw12.includes(streamBase10) || raw12.includes(streamBase11)) {
-      throw new Error(`(9.2) body12 cross-contaminated with other stream_file: ${raw12}`);
-    }
-
-    // 3. A foreground delegation runs while a detached one is in flight
-    io.send({
-      jsonrpc: "2.0",
-      id: 20,
-      method: "tools/call",
-      params: {
-        name: "general_task",
-        arguments: { prompt: "detached-probe-20", cwd: stateDir, background: true },
-      },
-    });
-    await io.waitUntil(() => !!io.responseFor(20), "detached response (id 20)");
-    const handle20 = JSON.parse(contentText(io.responseFor(20), 20)) as { task_id?: string; status?: string };
-    if (handle20.status !== "running" || typeof handle20.task_id !== "string") {
-      throw new Error(`(9.3) detached run must return running handle with task_id: ${JSON.stringify(handle20)}`);
-    }
-
-    io.send({
-      jsonrpc: "2.0",
-      id: 21,
-      method: "tools/call",
-      params: {
-        name: "general_task",
-        arguments: { prompt: "foreground-while-detached-21", cwd: stateDir },
-      },
-    });
-    await io.waitUntil(() => !!io.responseFor(21), "foreground delegation response (id 21)");
-    const resp21 = io.responseFor(21);
-    if (resp21?.result?.isError !== false) {
-      throw new Error(`(9.3) foreground delegation while detached must succeed: ${JSON.stringify(resp21)}`);
-    }
-    const body21 = JSON.parse(contentText(resp21, 21)) as TaskResultPayload;
-    if (body21.status !== "success") {
-      throw new Error(`(9.3) foreground delegation must report status "success": ${JSON.stringify(body21)}`);
-    }
-    if (body21.task_id === handle20.task_id) {
-      throw new Error(`(9.3) foreground delegation task_id must not collide with detached task_id: ${body21.task_id}`);
-    }
-
-    // Wait until detached run 20 completes so state is settled
-    let detached20Report: { finished?: boolean; result_ready?: boolean; status?: string } | undefined;
-    let pollId20 = 200;
-    while (!detached20Report) {
-      const pid = pollId20++;
+  try {
+    const { exitCode } = await driveMcpStdio(slowAgy, stateDir, async (io) => {
       io.send({
         jsonrpc: "2.0",
-        id: pid,
-        method: "tools/call",
-        params: { name: "watch_task", arguments: { stream_file: handle20.task_id } },
+        id: 1,
+        method: "initialize",
+        params: HANDSHAKE("concurrency-probe"),
       });
-      await io.waitUntil(() => !!io.responseFor(pid), `poll detached 20 (id ${pid})`);
-      const r = JSON.parse(contentText(io.responseFor(pid), pid)) as {
-        finished?: boolean;
-        result_ready?: boolean;
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "initialize response (id 1)");
+
+      type TaskResultPayload = {
         status?: string;
+        task_id?: string;
+        stream_file?: string;
+        prompt?: string;
+        [k: string]: unknown;
       };
-      if (r.finished === true && r.result_ready === true) {
-        detached20Report = r;
-        break;
+
+      // 1 & 2 & 4: Three concurrent delegations all succeed, no cross-contamination, watch_task answers mid-run
+      io.send({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "prompt-alpha-10", cwd: stateDir } },
+      });
+      io.send({
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "prompt-beta-11", cwd: stateDir } },
+      });
+      io.send({
+        jsonrpc: "2.0",
+        id: 12,
+        method: "tools/call",
+        params: { name: "explore_task", arguments: { prompt: "prompt-gamma-12", cwd: stateDir } },
+      });
+
+      // 4. watch_task still answers mid-run
+      io.send({ jsonrpc: "2.0", id: 13, method: "tools/call", params: { name: "watch_task", arguments: {} } });
+      await io.waitUntil(() => !!io.responseFor(13), "watch mid-run response (id 13)");
+      const watch13 = JSON.parse(contentText(io.responseFor(13), 13)) as {
+        found?: boolean;
+        running?: boolean;
+        finished?: boolean;
+      };
+      if (watch13.found !== true || watch13.running !== true || watch13.finished !== false) {
+        throw new Error(`(9.4) watch_task must answer found/running info mid-run, got: ${JSON.stringify(watch13)}`);
       }
-      await sleep(150);
-    }
-    if (detached20Report.status !== "success") {
-      throw new Error(`(9.3) detached run 20 must settle to success: ${JSON.stringify(detached20Report)}`);
+
+      // Wait for all three delegations to complete
+      await io.waitUntil(
+        () => !!io.responseFor(10) && !!io.responseFor(11) && !!io.responseFor(12),
+        "three concurrent delegations (ids 10, 11, 12)"
+      );
+
+      const resp10 = io.responseFor(10);
+      const resp11 = io.responseFor(11);
+      const resp12 = io.responseFor(12);
+
+      if (resp10?.result?.isError !== false || resp11?.result?.isError !== false || resp12?.result?.isError !== false) {
+        throw new Error(
+          "(9.1) all three concurrent delegations must answer isError: false, got: " +
+            `10=${JSON.stringify(resp10?.result?.isError)}, 11=${JSON.stringify(resp11?.result?.isError)}, 12=${JSON.stringify(resp12?.result?.isError)}`
+        );
+      }
+
+      const body10 = JSON.parse(contentText(resp10, 10)) as TaskResultPayload;
+      const body11 = JSON.parse(contentText(resp11, 11)) as TaskResultPayload;
+      const body12 = JSON.parse(contentText(resp12, 12)) as TaskResultPayload;
+
+      if (body10.status !== "success" || body11.status !== "success" || body12.status !== "success") {
+        throw new Error(
+          `(9.1) all three must have status "success", got: 10=${body10.status}, 11=${body11.status}, 12=${body12.status}`
+        );
+      }
+
+      const taskIds = [body10.task_id, body11.task_id, body12.task_id];
+      for (const tid of taskIds) {
+        if (typeof tid !== "string" || !tid.startsWith("task_")) {
+          throw new Error(`(9.1) invalid task_id in results: ${JSON.stringify(taskIds)}`);
+        }
+      }
+      if (new Set(taskIds).size !== 3) {
+        throw new Error(`(9.1) three distinct task_ids required, got: ${JSON.stringify(taskIds)}`);
+      }
+
+      const streamFiles = [body10.stream_file, body11.stream_file, body12.stream_file];
+      for (const sf of streamFiles) {
+        if (typeof sf !== "string" || !sf.endsWith(".stream")) {
+          throw new Error(`(9.1) invalid stream_file in results: ${JSON.stringify(streamFiles)}`);
+        }
+      }
+      if (new Set(streamFiles).size !== 3) {
+        throw new Error(`(9.1) three distinct stream_files required, got: ${JSON.stringify(streamFiles)}`);
+      }
+
+      // Check invocations in argfile so far: must be exactly 3
+      const invocations1 = readFileSync(argfile, "utf8")
+        .split("\n")
+        .filter((l) => l === "invoke").length;
+      if (invocations1 !== 3) {
+        throw new Error(`(9.1) fake agy must have been invoked exactly 3 times for 3 delegations, got ${invocations1}`);
+      }
+
+      // 2. No cross-contamination: prompt echoes match and no result carries another call's task_id / stream_file
+      if (
+        body10.prompt !== "prompt-alpha-10" ||
+        body11.prompt !== "prompt-beta-11" ||
+        body12.prompt !== "prompt-gamma-12"
+      ) {
+        throw new Error(
+          `(9.2) prompt echoes must match sent prompts: 10=${body10.prompt}, 11=${body11.prompt}, 12=${body12.prompt}`
+        );
+      }
+
+      const raw10 = JSON.stringify(body10);
+      const raw11 = JSON.stringify(body11);
+      const raw12 = JSON.stringify(body12);
+
+      const id10 = requireString(body10.task_id, "body10.task_id");
+      const id11 = requireString(body11.task_id, "body11.task_id");
+      const id12 = requireString(body12.task_id, "body12.task_id");
+
+      const sf10 = requireString(body10.stream_file, "body10.stream_file");
+      const sf11 = requireString(body11.stream_file, "body11.stream_file");
+      const sf12 = requireString(body12.stream_file, "body12.stream_file");
+
+      if (raw10.includes(id11) || raw10.includes(id12)) {
+        throw new Error(`(9.2) body10 cross-contaminated with other task_id: ${raw10}`);
+      }
+      if (raw11.includes(id10) || raw11.includes(id12)) {
+        throw new Error(`(9.2) body11 cross-contaminated with other task_id: ${raw11}`);
+      }
+      if (raw12.includes(id10) || raw12.includes(id11)) {
+        throw new Error(`(9.2) body12 cross-contaminated with other task_id: ${raw12}`);
+      }
+
+      const streamBase10 = path.basename(sf10);
+      const streamBase11 = path.basename(sf11);
+      const streamBase12 = path.basename(sf12);
+
+      if (raw10.includes(streamBase11) || raw10.includes(streamBase12)) {
+        throw new Error(`(9.2) body10 cross-contaminated with other stream_file: ${raw10}`);
+      }
+      if (raw11.includes(streamBase10) || raw11.includes(streamBase12)) {
+        throw new Error(`(9.2) body11 cross-contaminated with other stream_file: ${raw11}`);
+      }
+      if (raw12.includes(streamBase10) || raw12.includes(streamBase11)) {
+        throw new Error(`(9.2) body12 cross-contaminated with other stream_file: ${raw12}`);
+      }
+
+      // 3. A foreground delegation runs while a detached one is in flight
+      io.send({
+        jsonrpc: "2.0",
+        id: 20,
+        method: "tools/call",
+        params: {
+          name: "general_task",
+          arguments: { prompt: "detached-probe-20", cwd: stateDir, background: true },
+        },
+      });
+      await io.waitUntil(() => !!io.responseFor(20), "detached response (id 20)");
+      const handle20 = JSON.parse(contentText(io.responseFor(20), 20)) as { task_id?: string; status?: string };
+      if (handle20.status !== "running" || typeof handle20.task_id !== "string") {
+        throw new Error(`(9.3) detached run must return running handle with task_id: ${JSON.stringify(handle20)}`);
+      }
+
+      io.send({
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: {
+          name: "general_task",
+          arguments: { prompt: "foreground-while-detached-21", cwd: stateDir },
+        },
+      });
+      await io.waitUntil(() => !!io.responseFor(21), "foreground delegation response (id 21)");
+      const resp21 = io.responseFor(21);
+      if (resp21?.result?.isError !== false) {
+        throw new Error(`(9.3) foreground delegation while detached must succeed: ${JSON.stringify(resp21)}`);
+      }
+      const body21 = JSON.parse(contentText(resp21, 21)) as TaskResultPayload;
+      if (body21.status !== "success") {
+        throw new Error(`(9.3) foreground delegation must report status "success": ${JSON.stringify(body21)}`);
+      }
+      if (body21.task_id === handle20.task_id) {
+        throw new Error(
+          `(9.3) foreground delegation task_id must not collide with detached task_id: ${body21.task_id}`
+        );
+      }
+
+      // Wait until detached run 20 completes so state is settled
+      let detached20Report: { finished?: boolean; result_ready?: boolean; status?: string } | undefined;
+      let pollId20 = 200;
+      while (!detached20Report) {
+        const pid = pollId20++;
+        io.send({
+          jsonrpc: "2.0",
+          id: pid,
+          method: "tools/call",
+          params: { name: "watch_task", arguments: { stream_file: handle20.task_id } },
+        });
+        await io.waitUntil(() => !!io.responseFor(pid), `poll detached 20 (id ${pid})`);
+        const r = JSON.parse(contentText(io.responseFor(pid), pid)) as {
+          finished?: boolean;
+          result_ready?: boolean;
+          status?: string;
+        };
+        if (r.finished === true && r.result_ready === true) {
+          detached20Report = r;
+          break;
+        }
+        await sleep(150);
+      }
+      if (detached20Report.status !== "success") {
+        throw new Error(`(9.3) detached run 20 must settle to success: ${JSON.stringify(detached20Report)}`);
+      }
+
+      // 5. Cancel targets the right run: with two delegations in flight, watch_task with cancel: true
+      //    and stream_file: "<task id of run A>" cancels A only; B keeps running and finishes.
+      const streamsBefore5 = new Set(readdirSync(stateDir).filter((f) => f.endsWith(".stream")));
+      io.send({
+        jsonrpc: "2.0",
+        id: 30,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "run-A-to-cancel", cwd: stateDir } },
+      });
+      await io.waitUntil(
+        () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore5.has(f)).length > 0,
+        "run A stream creation"
+      );
+      const foundStreamA = readdirSync(stateDir).find((f) => f.endsWith(".stream") && !streamsBefore5.has(f));
+      if (!foundStreamA) {
+        throw new Error("(9.5) run A stream file not found");
+      }
+      const streamFileA = foundStreamA;
+      const taskIdA = path.basename(streamFileA, ".stream");
+
+      io.send({
+        jsonrpc: "2.0",
+        id: 31,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "run-B-to-keep", cwd: stateDir } },
+      });
+      await io.waitUntil(
+        () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore5.has(f)).length > 1,
+        "run B stream creation"
+      );
+
+      io.send({
+        jsonrpc: "2.0",
+        id: 32,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { stream_file: taskIdA, cancel: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(32), "watch_task cancel response (id 32)");
+      const report32 = JSON.parse(contentText(io.responseFor(32), 32)) as {
+        running?: boolean;
+        finished?: boolean;
+        hint?: string;
+      };
+      if (report32.running !== false || report32.finished !== true) {
+        throw new Error(`(9.5) watch_task report for cancelled run A must show finished: ${JSON.stringify(report32)}`);
+      }
+      if (report32.hint !== undefined) {
+        throw new Error(`(9.5) working cancel must not carry an ignored hint: ${JSON.stringify(report32)}`);
+      }
+
+      await io.waitUntil(() => !!io.responseFor(30), "cancelled run A response (id 30)");
+      const resp30 = io.responseFor(30);
+      if (resp30?.result?.isError !== true) {
+        throw new Error(`(9.5) cancelled run A must return isError: true, got: ${JSON.stringify(resp30)}`);
+      }
+      const body30 = JSON.parse(contentText(resp30, 30)) as TaskResultPayload;
+      if (body30.status === "success") {
+        throw new Error(`(9.5) cancelled run A status must not be success: ${JSON.stringify(body30)}`);
+      }
+
+      await io.waitUntil(() => !!io.responseFor(31), "run B response (id 31)");
+      const resp31 = io.responseFor(31);
+      if (resp31?.result?.isError !== false) {
+        throw new Error(`(9.5) run B must succeed despite run A cancellation: ${JSON.stringify(resp31)}`);
+      }
+      const body31 = JSON.parse(contentText(resp31, 31)) as TaskResultPayload;
+      if (body31.status !== "success" || body31.prompt !== "run-B-to-keep") {
+        throw new Error(`(9.5) run B must report success with prompt: ${JSON.stringify(body31)}`);
+      }
+
+      // 6a. Cancel with no stream_file and more than one delegation in flight is ignored and mentions ambiguity
+      const streamsBefore6a = new Set(readdirSync(stateDir).filter((f) => f.endsWith(".stream")));
+      io.send({
+        jsonrpc: "2.0",
+        id: 40,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "ambiguous-run-A", cwd: stateDir } },
+      });
+      io.send({
+        jsonrpc: "2.0",
+        id: 41,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "ambiguous-run-B", cwd: stateDir } },
+      });
+      await io.waitUntil(
+        () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore6a.has(f)).length >= 2,
+        "both ambiguous runs in flight"
+      );
+
+      io.send({
+        jsonrpc: "2.0",
+        id: 42,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { cancel: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(42), "ambiguous cancel response (id 42)");
+      const report42 = JSON.parse(contentText(io.responseFor(42), 42)) as {
+        running?: boolean;
+        hint?: string;
+      };
+      if (report42.running !== true) {
+        throw new Error(`(9.6a) ambiguous cancel must not stop runs: ${JSON.stringify(report42)}`);
+      }
+      if (
+        typeof report42.hint !== "string" ||
+        !report42.hint.includes("stream_file") ||
+        (!report42.hint.includes("ambiguous") && !report42.hint.includes("several delegations"))
+      ) {
+        throw new Error(`(9.6a) ambiguous cancel must carry hint explaining ambiguity: ${JSON.stringify(report42)}`);
+      }
+
+      await io.waitUntil(() => !!io.responseFor(40) && !!io.responseFor(41), "ambiguous runs completion");
+      const resp40 = io.responseFor(40);
+      const resp41 = io.responseFor(41);
+      if (resp40?.result?.isError !== false || resp41?.result?.isError !== false) {
+        throw new Error("(9.6a) both runs must succeed since cancel was ignored");
+      }
+
+      // 6b. With exactly one in flight, cancel with no stream_file still cancels it
+      const streamsBefore6b = new Set(readdirSync(stateDir).filter((f) => f.endsWith(".stream")));
+      io.send({
+        jsonrpc: "2.0",
+        id: 45,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "single-run-to-cancel", cwd: stateDir } },
+      });
+      await io.waitUntil(
+        () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore6b.has(f)).length >= 1,
+        "single run in flight"
+      );
+      io.send({
+        jsonrpc: "2.0",
+        id: 46,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { cancel: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(46), "single cancel response (id 46)");
+      const report46 = JSON.parse(contentText(io.responseFor(46), 46)) as {
+        running?: boolean;
+        finished?: boolean;
+        hint?: string;
+      };
+      if (report46.running !== false || report46.finished !== true) {
+        throw new Error(`(9.6b) single cancel must stop the run: ${JSON.stringify(report46)}`);
+      }
+      if (report46.hint !== undefined) {
+        throw new Error(`(9.6b) single cancel must not carry an ignored hint: ${JSON.stringify(report46)}`);
+      }
+      await io.waitUntil(() => !!io.responseFor(45), "cancelled single run response (id 45)");
+      const resp45 = io.responseFor(45);
+      if (resp45?.result?.isError !== true) {
+        throw new Error(`(9.6b) cancelled single run must return isError: true: ${JSON.stringify(resp45)}`);
+      }
+
+      // 7. A notifications/cancelled for one request id does not disturb the other
+      const streamsBefore7 = new Set(readdirSync(stateDir).filter((f) => f.endsWith(".stream")));
+      io.send({
+        jsonrpc: "2.0",
+        id: 50,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "rpc-cancel-A", cwd: stateDir } },
+      });
+      io.send({
+        jsonrpc: "2.0",
+        id: 51,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "rpc-keep-B", cwd: stateDir } },
+      });
+      await io.waitUntil(
+        () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore7.has(f)).length >= 2,
+        "both rpc cancel runs in flight"
+      );
+
+      io.send({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: 50 },
+      });
+
+      await io.waitUntil(() => !!io.responseFor(50), "cancelled request 50 response");
+      const resp50 = io.responseFor(50);
+      if (resp50?.result?.isError !== true) {
+        throw new Error(`(9.7) cancelled request 50 must return isError: true: ${JSON.stringify(resp50)}`);
+      }
+
+      await io.waitUntil(() => !!io.responseFor(51), "kept request 51 response");
+      const resp51 = io.responseFor(51);
+      if (resp51?.result?.isError !== false) {
+        throw new Error(`(9.7) request 51 must succeed undisturbed: ${JSON.stringify(resp51)}`);
+      }
+      const body51 = JSON.parse(contentText(resp51, 51)) as TaskResultPayload;
+      if (body51.status !== "success" || body51.prompt !== "rpc-keep-B") {
+        throw new Error(`(9.7) request 51 must report success: ${JSON.stringify(body51)}`);
+      }
+
+      // 8. Drain multiple detached runs on client disconnect
+      io.send({
+        jsonrpc: "2.0",
+        id: 60,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "drain-detached-A", cwd: stateDir, background: true } },
+      });
+      io.send({
+        jsonrpc: "2.0",
+        id: 61,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "drain-detached-B", cwd: stateDir, background: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(60) && !!io.responseFor(61), "both detached handles (ids 60, 61)");
+      const handle60 = JSON.parse(contentText(io.responseFor(60), 60)) as { task_id?: string; status?: string };
+      const handle61 = JSON.parse(contentText(io.responseFor(61), 61)) as { task_id?: string; status?: string };
+      if (handle60.status !== "running" || handle61.status !== "running") {
+        throw new Error(`(9.8) both detached runs must start running: 60=${handle60.status}, 61=${handle61.status}`);
+      }
+      detachedIdA = requireString(handle60.task_id, "handle60.task_id");
+      detachedIdB = requireString(handle61.task_id, "handle61.task_id");
+    });
+
+    if (exitCode !== 0) {
+      throw new Error(`concurrency suite must exit 0, got ${exitCode}`);
     }
 
-    // 5. Cancel targets the right run: with two delegations in flight, watch_task with cancel: true
-    //    and stream_file: "<task id of run A>" cancels A only; B keeps running and finishes.
-    const streamsBefore5 = new Set(readdirSync(stateDir).filter((f) => f.endsWith(".stream")));
-    io.send({
-      jsonrpc: "2.0",
-      id: 30,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "run-A-to-cancel", cwd: stateDir } },
-    });
-    await io.waitUntil(
-      () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore5.has(f)).length > 0,
-      "run A stream creation"
+    const receiptA = path.join(stateDir, `${detachedIdA}.ndjson`);
+    const receiptB = path.join(stateDir, `${detachedIdB}.ndjson`);
+    if (!existsSync(receiptA) || !existsSync(receiptB)) {
+      throw new Error(`(9.8) both drained receipts must exist: A=${existsSync(receiptA)}, B=${existsSync(receiptB)}`);
+    }
+    const contentA = readFileSync(receiptA, "utf8");
+    const contentB = readFileSync(receiptB, "utf8");
+    if (!contentA.includes('"status":"success"') || !contentB.includes('"status":"success"')) {
+      throw new Error("(9.8) both drained runs must have recorded success in receipts");
+    }
+
+    console.log(
+      "concurrency: 3 concurrent delegations succeed with distinct task_ids and stream_files (argfile count = 3), no cross-contamination, foreground runs while detached in flight, watch_task mid-run, targeted cancel, ambiguous cancel ignored with hint, single cancel works, notifications/cancelled per-id, multiple detached runs drained on disconnect: ok"
     );
-    const foundStreamA = readdirSync(stateDir).find((f) => f.endsWith(".stream") && !streamsBefore5.has(f));
-    if (!foundStreamA) {
-      throw new Error("(9.5) run A stream file not found");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    try {
+      unlinkSync(slowAgy);
+    } catch {
+      /* ignore unlink error */
     }
-    const streamFileA = foundStreamA;
-    const taskIdA = path.basename(streamFileA, ".stream");
-
-    io.send({
-      jsonrpc: "2.0",
-      id: 31,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "run-B-to-keep", cwd: stateDir } },
-    });
-    await io.waitUntil(
-      () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore5.has(f)).length > 1,
-      "run B stream creation"
-    );
-
-    io.send({
-      jsonrpc: "2.0",
-      id: 32,
-      method: "tools/call",
-      params: { name: "watch_task", arguments: { stream_file: taskIdA, cancel: true } },
-    });
-    await io.waitUntil(() => !!io.responseFor(32), "watch_task cancel response (id 32)");
-    const report32 = JSON.parse(contentText(io.responseFor(32), 32)) as {
-      running?: boolean;
-      finished?: boolean;
-      hint?: string;
-    };
-    if (report32.running !== false || report32.finished !== true) {
-      throw new Error(`(9.5) watch_task report for cancelled run A must show finished: ${JSON.stringify(report32)}`);
-    }
-    if (report32.hint !== undefined) {
-      throw new Error(`(9.5) working cancel must not carry an ignored hint: ${JSON.stringify(report32)}`);
-    }
-
-    await io.waitUntil(() => !!io.responseFor(30), "cancelled run A response (id 30)");
-    const resp30 = io.responseFor(30);
-    if (resp30?.result?.isError !== true) {
-      throw new Error(`(9.5) cancelled run A must return isError: true, got: ${JSON.stringify(resp30)}`);
-    }
-    const body30 = JSON.parse(contentText(resp30, 30)) as TaskResultPayload;
-    if (body30.status === "success") {
-      throw new Error(`(9.5) cancelled run A status must not be success: ${JSON.stringify(body30)}`);
-    }
-
-    await io.waitUntil(() => !!io.responseFor(31), "run B response (id 31)");
-    const resp31 = io.responseFor(31);
-    if (resp31?.result?.isError !== false) {
-      throw new Error(`(9.5) run B must succeed despite run A cancellation: ${JSON.stringify(resp31)}`);
-    }
-    const body31 = JSON.parse(contentText(resp31, 31)) as TaskResultPayload;
-    if (body31.status !== "success" || body31.prompt !== "run-B-to-keep") {
-      throw new Error(`(9.5) run B must report success with prompt: ${JSON.stringify(body31)}`);
-    }
-
-    // 6a. Cancel with no stream_file and more than one delegation in flight is ignored and mentions ambiguity
-    const streamsBefore6a = new Set(readdirSync(stateDir).filter((f) => f.endsWith(".stream")));
-    io.send({
-      jsonrpc: "2.0",
-      id: 40,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "ambiguous-run-A", cwd: stateDir } },
-    });
-    io.send({
-      jsonrpc: "2.0",
-      id: 41,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "ambiguous-run-B", cwd: stateDir } },
-    });
-    await io.waitUntil(
-      () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore6a.has(f)).length >= 2,
-      "both ambiguous runs in flight"
-    );
-
-    io.send({
-      jsonrpc: "2.0",
-      id: 42,
-      method: "tools/call",
-      params: { name: "watch_task", arguments: { cancel: true } },
-    });
-    await io.waitUntil(() => !!io.responseFor(42), "ambiguous cancel response (id 42)");
-    const report42 = JSON.parse(contentText(io.responseFor(42), 42)) as {
-      running?: boolean;
-      hint?: string;
-    };
-    if (report42.running !== true) {
-      throw new Error(`(9.6a) ambiguous cancel must not stop runs: ${JSON.stringify(report42)}`);
-    }
-    if (
-      typeof report42.hint !== "string" ||
-      !report42.hint.includes("stream_file") ||
-      (!report42.hint.includes("ambiguous") && !report42.hint.includes("several delegations"))
-    ) {
-      throw new Error(`(9.6a) ambiguous cancel must carry hint explaining ambiguity: ${JSON.stringify(report42)}`);
-    }
-
-    await io.waitUntil(() => !!io.responseFor(40) && !!io.responseFor(41), "ambiguous runs completion");
-    const resp40 = io.responseFor(40);
-    const resp41 = io.responseFor(41);
-    if (resp40?.result?.isError !== false || resp41?.result?.isError !== false) {
-      throw new Error("(9.6a) both runs must succeed since cancel was ignored");
-    }
-
-    // 6b. With exactly one in flight, cancel with no stream_file still cancels it
-    const streamsBefore6b = new Set(readdirSync(stateDir).filter((f) => f.endsWith(".stream")));
-    io.send({
-      jsonrpc: "2.0",
-      id: 45,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "single-run-to-cancel", cwd: stateDir } },
-    });
-    await io.waitUntil(
-      () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore6b.has(f)).length >= 1,
-      "single run in flight"
-    );
-    io.send({
-      jsonrpc: "2.0",
-      id: 46,
-      method: "tools/call",
-      params: { name: "watch_task", arguments: { cancel: true } },
-    });
-    await io.waitUntil(() => !!io.responseFor(46), "single cancel response (id 46)");
-    const report46 = JSON.parse(contentText(io.responseFor(46), 46)) as {
-      running?: boolean;
-      finished?: boolean;
-      hint?: string;
-    };
-    if (report46.running !== false || report46.finished !== true) {
-      throw new Error(`(9.6b) single cancel must stop the run: ${JSON.stringify(report46)}`);
-    }
-    if (report46.hint !== undefined) {
-      throw new Error(`(9.6b) single cancel must not carry an ignored hint: ${JSON.stringify(report46)}`);
-    }
-    await io.waitUntil(() => !!io.responseFor(45), "cancelled single run response (id 45)");
-    const resp45 = io.responseFor(45);
-    if (resp45?.result?.isError !== true) {
-      throw new Error(`(9.6b) cancelled single run must return isError: true: ${JSON.stringify(resp45)}`);
-    }
-
-    // 7. A notifications/cancelled for one request id does not disturb the other
-    const streamsBefore7 = new Set(readdirSync(stateDir).filter((f) => f.endsWith(".stream")));
-    io.send({
-      jsonrpc: "2.0",
-      id: 50,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "rpc-cancel-A", cwd: stateDir } },
-    });
-    io.send({
-      jsonrpc: "2.0",
-      id: 51,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "rpc-keep-B", cwd: stateDir } },
-    });
-    await io.waitUntil(
-      () => readdirSync(stateDir).filter((f) => f.endsWith(".stream") && !streamsBefore7.has(f)).length >= 2,
-      "both rpc cancel runs in flight"
-    );
-
-    io.send({
-      jsonrpc: "2.0",
-      method: "notifications/cancelled",
-      params: { requestId: 50 },
-    });
-
-    await io.waitUntil(() => !!io.responseFor(50), "cancelled request 50 response");
-    const resp50 = io.responseFor(50);
-    if (resp50?.result?.isError !== true) {
-      throw new Error(`(9.7) cancelled request 50 must return isError: true: ${JSON.stringify(resp50)}`);
-    }
-
-    await io.waitUntil(() => !!io.responseFor(51), "kept request 51 response");
-    const resp51 = io.responseFor(51);
-    if (resp51?.result?.isError !== false) {
-      throw new Error(`(9.7) request 51 must succeed undisturbed: ${JSON.stringify(resp51)}`);
-    }
-    const body51 = JSON.parse(contentText(resp51, 51)) as TaskResultPayload;
-    if (body51.status !== "success" || body51.prompt !== "rpc-keep-B") {
-      throw new Error(`(9.7) request 51 must report success: ${JSON.stringify(body51)}`);
-    }
-
-    // 8. Drain multiple detached runs on client disconnect
-    io.send({
-      jsonrpc: "2.0",
-      id: 60,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "drain-detached-A", cwd: stateDir, background: true } },
-    });
-    io.send({
-      jsonrpc: "2.0",
-      id: 61,
-      method: "tools/call",
-      params: { name: "general_task", arguments: { prompt: "drain-detached-B", cwd: stateDir, background: true } },
-    });
-    await io.waitUntil(() => !!io.responseFor(60) && !!io.responseFor(61), "both detached handles (ids 60, 61)");
-    const handle60 = JSON.parse(contentText(io.responseFor(60), 60)) as { task_id?: string; status?: string };
-    const handle61 = JSON.parse(contentText(io.responseFor(61), 61)) as { task_id?: string; status?: string };
-    if (handle60.status !== "running" || handle61.status !== "running") {
-      throw new Error(`(9.8) both detached runs must start running: 60=${handle60.status}, 61=${handle61.status}`);
-    }
-    detachedIdA = requireString(handle60.task_id, "handle60.task_id");
-    detachedIdB = requireString(handle61.task_id, "handle61.task_id");
-  });
-
-  if (exitCode !== 0) {
-    throw new Error(`concurrency suite must exit 0, got ${exitCode}`);
   }
+}
 
-  const receiptA = path.join(stateDir, `${detachedIdA}.ndjson`);
-  const receiptB = path.join(stateDir, `${detachedIdB}.ndjson`);
-  if (!existsSync(receiptA) || !existsSync(receiptB)) {
-    throw new Error(`(9.8) both drained receipts must exist: A=${existsSync(receiptA)}, B=${existsSync(receiptB)}`);
-  }
-  const contentA = readFileSync(receiptA, "utf8");
-  const contentB = readFileSync(receiptB, "utf8");
-  if (!contentA.includes('"status":"success"') || !contentB.includes('"status":"success"')) {
-    throw new Error("(9.8) both drained runs must have recorded success in receipts");
-  }
+// ---------------------------------------------------------------------------
+// 9b. Concurrent git audit: shared working tree attaches audit_note (F1 / F8)
+// ---------------------------------------------------------------------------
+{
+  const gitRepo = mkdtempSync(path.join(os.tmpdir(), "agy-concurrency-git-"));
+  const auditStateDir = mkdtempSync(path.join(os.tmpdir(), "agy-concurrency-audit-state-"));
+  const auditFakeAgy = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  try {
+    spawnSync("git", ["init", gitRepo]);
+    writeFileSync(path.join(gitRepo, "base.txt"), "init\n");
+    spawnSync("git", ["-C", gitRepo, "add", "."]);
+    spawnSync("git", ["-C", gitRepo, "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-m", "init"]);
 
-  console.log(
-    "concurrency: 3 concurrent delegations succeed with distinct task_ids and stream_files (argfile count = 3), no cross-contamination, foreground runs while detached in flight, watch_task mid-run, targeted cancel, ambiguous cancel ignored with hint, single cancel works, notifications/cancelled per-id, multiple detached runs drained on disconnect: ok"
-  );
+    writeFileSync(
+      auditFakeAgy,
+      `#!/bin/sh
+sleep 0.3
+case " $* " in
+  *" write-alpha "*) echo "alpha" > alpha.txt ;;
+  *" write-beta "*) echo "beta" > beta.txt ;;
+  *" write-solo "*) echo "solo" > solo.txt ;;
+esac
+sleep 0.3
+printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"done","duration_seconds":0.6}}'
+`
+    );
+    chmodSync(auditFakeAgy, 0o755);
+
+    const { exitCode } = await driveMcpStdio(auditFakeAgy, auditStateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("audit-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "init audit-probe");
+
+      type AuditResultPayload = {
+        status?: string;
+        audit_note?: string;
+        files_touched?: string[];
+      };
+
+      // Two concurrent delegations in the same git working tree
+      io.send({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "write-alpha", cwd: gitRepo } },
+      });
+      io.send({
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "write-beta", cwd: gitRepo } },
+      });
+
+      await io.waitUntil(() => !!io.responseFor(10) && !!io.responseFor(11), "concurrent audit runs (10, 11)");
+      const resp10 = io.responseFor(10);
+      const resp11 = io.responseFor(11);
+      if (resp10?.result?.isError !== false || resp11?.result?.isError !== false) {
+        throw new Error(
+          `(F8) both concurrent runs must succeed: 10=${JSON.stringify(resp10)}, 11=${JSON.stringify(resp11)}`
+        );
+      }
+
+      const body10 = JSON.parse(contentText(resp10, 10)) as AuditResultPayload;
+      const body11 = JSON.parse(contentText(resp11, 11)) as AuditResultPayload;
+
+      if (typeof body10.audit_note !== "string" || !body10.audit_note.includes("shared")) {
+        throw new Error(
+          `(F8) run 10 must carry audit_note about shared tree, got: ${JSON.stringify(body10.audit_note)}`
+        );
+      }
+      if (typeof body11.audit_note !== "string" || !body11.audit_note.includes("shared")) {
+        throw new Error(
+          `(F8) run 11 must carry audit_note about shared tree, got: ${JSON.stringify(body11.audit_note)}`
+        );
+      }
+
+      if (!body10.files_touched?.includes("alpha.txt") || !body10.files_touched?.includes("beta.txt")) {
+        throw new Error(`(F8) run 10 files_touched must include both files: ${JSON.stringify(body10.files_touched)}`);
+      }
+      if (!body11.files_touched?.includes("alpha.txt") || !body11.files_touched?.includes("beta.txt")) {
+        throw new Error(`(F8) run 11 files_touched must include both files: ${JSON.stringify(body11.files_touched)}`);
+      }
+
+      // Solo delegation in the same repo
+      io.send({
+        jsonrpc: "2.0",
+        id: 12,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "write-solo", cwd: gitRepo } },
+      });
+      await io.waitUntil(() => !!io.responseFor(12), "solo audit run (12)");
+      const resp12 = io.responseFor(12);
+      if (resp12?.result?.isError !== false) {
+        throw new Error(`(F8) solo run must succeed: ${JSON.stringify(resp12)}`);
+      }
+      const body12 = JSON.parse(contentText(resp12, 12)) as AuditResultPayload;
+
+      if (Object.hasOwn(body12, "audit_note") || body12.audit_note !== undefined) {
+        throw new Error(`(F8) solo run must NOT carry audit_note: ${JSON.stringify(body12.audit_note)}`);
+      }
+      if (!body12.files_touched?.includes("solo.txt")) {
+        throw new Error(`(F8) solo run files_touched must include solo.txt: ${JSON.stringify(body12.files_touched)}`);
+      }
+    });
+
+    if (exitCode !== 0) {
+      throw new Error(`(F8) audit suite must exit 0, got ${exitCode}`);
+    }
+
+    console.log(
+      "concurrent git audit: concurrent runs in shared repo carry audit_note and report all touched files; solo run carries no audit_note: ok"
+    );
+  } finally {
+    rmSync(gitRepo, { recursive: true, force: true });
+    rmSync(auditStateDir, { recursive: true, force: true });
+    try {
+      unlinkSync(auditFakeAgy);
+    } catch {
+      /* ignore unlink error */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 9c. Detached cancellation drain on immediate disconnect (F2)
+// ---------------------------------------------------------------------------
+{
+  const f2StateDir = mkdtempSync(path.join(os.tmpdir(), "agy-f2-state-"));
+  const f2AgyBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  try {
+    writeFileSync(
+      f2AgyBin,
+      `#!/bin/sh
+sleep 1.2
+printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"slow-ok","duration_seconds":1.2}}'
+`
+    );
+    chmodSync(f2AgyBin, 0o755);
+
+    let f2TaskId = "";
+    const { exitCode: f2Exit } = await driveMcpStdio(f2AgyBin, f2StateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("f2-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "init f2-probe");
+
+      io.send({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "f2-detached", cwd: f2StateDir, background: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(10), "f2 handle");
+      const h = JSON.parse(contentText(io.responseFor(10), 10)) as { task_id?: string; status?: string };
+      if (typeof h.task_id !== "string") throw new Error("f2 handle missing task_id");
+      f2TaskId = h.task_id;
+
+      // Send cancellation notification and immediately return so stdin closes
+      io.send({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: 10 },
+      });
+    });
+
+    if (f2Exit !== 0) {
+      throw new Error(`(F2) server must exit 0 after draining cancelled detached run, got ${f2Exit}`);
+    }
+
+    // Receipt must exist on disk and record the cancellation
+    const receiptPath = path.join(f2StateDir, `${f2TaskId}.ndjson`);
+    if (!existsSync(receiptPath)) {
+      throw new Error(`(F2) cancelled detached run receipt must exist at ${receiptPath}`);
+    }
+    const receiptContent = readFileSync(receiptPath, "utf8");
+    if (!receiptContent.includes('"event":"result"') || !receiptContent.includes("cancel")) {
+      throw new Error(`(F2) receipt must record cancellation: ${receiptContent}`);
+    }
+
+    // Boot a second server instance against the same state dir and assert watch_task sees the cancelled result
+    let secondWatch: Record<string, unknown> = {};
+    const { exitCode: secondExit } = await driveMcpStdio("/bin/true", f2StateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("f2-verify") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "init f2-verify");
+
+      io.send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { stream_file: f2TaskId } },
+      });
+      await io.waitUntil(() => !!io.responseFor(2), "f2 watch response");
+      secondWatch = JSON.parse(contentText(io.responseFor(2), 2)) as Record<string, unknown>;
+    });
+
+    if (secondExit !== 0) {
+      throw new Error(`(F2) second server must exit 0, got ${secondExit}`);
+    }
+    if (secondWatch.finished !== true || secondWatch.result_ready !== true) {
+      throw new Error(`(F2) second server watch report must show finished run: ${JSON.stringify(secondWatch)}`);
+    }
+    if (secondWatch.status !== "error") {
+      throw new Error(`(F2) second server watch report status must be error: ${JSON.stringify(secondWatch)}`);
+    }
+
+    console.log(
+      "detached cancel with immediate disconnect: drain preserves cancellation receipt, second server reads cancelled result: ok"
+    );
+  } finally {
+    rmSync(f2StateDir, { recursive: true, force: true });
+    try {
+      unlinkSync(f2AgyBin);
+    } catch {
+      /* ignore unlink error */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 9d. Targeted cancel without stream_file targets the cancelled run (F3)
+// ---------------------------------------------------------------------------
+{
+  const f3StateDir = mkdtempSync(path.join(os.tmpdir(), "agy-f3-state-"));
+  const f3AgyBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  try {
+    writeFileSync(
+      f3AgyBin,
+      `#!/bin/sh
+sleep 5
+printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"f3-ok","duration_seconds":5}}'
+`
+    );
+    chmodSync(f3AgyBin, 0o755);
+
+    // Create an older, finished run whose transcript is touched into the future
+    writeFileSync(
+      path.join(f3StateDir, "task_older99.stream"),
+      "session open · cwd=/work · permission_mode=accept-edits · tools=1\n== done: status=SUCCESS · 1s\n"
+    );
+    writeFileSync(
+      path.join(f3StateDir, "task_older99.ndjson"),
+      `${JSON.stringify({ ts: Date.now(), event: "result", result: { task_id: "task_older99", status: "success" } })}\n`
+    );
+    const future = new Date(Date.now() + 60_000);
+    utimesSync(path.join(f3StateDir, "task_older99.stream"), future, future);
+
+    const { exitCode: f3Exit } = await driveMcpStdio(f3AgyBin, f3StateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("f3-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "init f3");
+
+      io.send({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "run-A", cwd: f3StateDir, background: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(10), "run A handle");
+      const handleA = JSON.parse(contentText(io.responseFor(10), 10)) as { task_id?: string };
+      const taskIdA = handleA.task_id;
+      if (typeof taskIdA !== "string") throw new Error("(F3) run A missing task_id");
+
+      // Call watch_task({ cancel: true }) with NO stream_file
+      io.send({
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { cancel: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(11), "watch cancel response (11)");
+      const report11 = JSON.parse(contentText(io.responseFor(11), 11)) as {
+        task_id?: string;
+        file?: string;
+        running?: boolean;
+        finished?: boolean;
+      };
+
+      if (report11.task_id !== taskIdA) {
+        throw new Error(`(F3) report must be about cancelled run A (${taskIdA}), got ${report11.task_id}`);
+      }
+      if (report11.file && !report11.file.includes(taskIdA)) {
+        throw new Error(`(F3) report file must point to run A stream, got ${report11.file}`);
+      }
+      if (report11.running !== false || report11.finished !== true) {
+        throw new Error(`(F3) run A must report finished true, got ${JSON.stringify(report11)}`);
+      }
+    });
+
+    if (f3Exit !== 0) {
+      throw new Error(`(F3) suite must exit 0, got ${f3Exit}`);
+    }
+
+    console.log(
+      "targeted cancel without stream_file: report targets the cancelled in-flight run rather than newer finished mtime file: ok"
+    );
+  } finally {
+    rmSync(f3StateDir, { recursive: true, force: true });
+    try {
+      unlinkSync(f3AgyBin);
+    } catch {
+      /* ignore unlink error */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 9e. Request id reuse does not clobber active delegation registry (F4)
+// ---------------------------------------------------------------------------
+{
+  const f4StateDir = mkdtempSync(path.join(os.tmpdir(), "agy-f4-state-"));
+  const f4AgyBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  try {
+    writeFileSync(
+      f4AgyBin,
+      `#!/bin/sh
+case " $* " in
+  *" run-1-fast "*) sleep 0.1 ;;
+  *" run-2-slow "*) sleep 5 ;;
+esac
+printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"ok","duration_seconds":0.1}}'
+`
+    );
+    chmodSync(f4AgyBin, 0o755);
+
+    const { exitCode: f4Exit } = await driveMcpStdio(f4AgyBin, f4StateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("f4-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "init f4");
+
+      // 1. Start detached delegation with id 99 (fast)
+      io.send({
+        jsonrpc: "2.0",
+        id: 99,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "run-1-fast", cwd: f4StateDir, background: true } },
+      });
+      await io.waitUntil(() => io.parsed().filter((p) => p.id === 99).length >= 1, "run 1 handle (id 99)");
+      const rawHandle1 = io.parsed().find((p) => p.id === 99);
+      const handle1 = JSON.parse(contentText(rawHandle1, 99)) as { task_id?: string };
+      const task1Id = handle1.task_id;
+      if (typeof task1Id !== "string") throw new Error("(F4) missing task1Id");
+
+      // 2. Reuse id 99 for a second detached delegation (slow)
+      io.send({
+        jsonrpc: "2.0",
+        id: 99,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "run-2-slow", cwd: f4StateDir, background: true } },
+      });
+      await io.waitUntil(() => io.parsed().filter((p) => p.id === 99).length >= 2, "run 2 handle (id 99)");
+      const rawHandle2 = io.parsed().filter((p) => p.id === 99)[1];
+      const handle2 = JSON.parse(contentText(rawHandle2, 99)) as { task_id?: string };
+      const task2Id = handle2.task_id;
+      if (typeof task2Id !== "string") throw new Error("(F4) missing task2Id");
+
+      // 3. Wait until run 1 finishes so its finally runs
+      const receipt1 = path.join(f4StateDir, `${task1Id}.ndjson`);
+      const deadline = Date.now() + 5000;
+      while (!existsSync(receipt1) && Date.now() < deadline) await sleep(50);
+      if (!existsSync(receipt1)) throw new Error("(F4) run 1 did not finish in time");
+      await sleep(100);
+
+      // 4. Cancel run 2 via watch_task: must succeed and find run 2 in the registry
+      io.send({
+        jsonrpc: "2.0",
+        id: 100,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { stream_file: task2Id, cancel: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(100), "watch cancel run 2 (id 100)");
+      const cancelReport = JSON.parse(contentText(io.responseFor(100), 100)) as {
+        running?: boolean;
+        finished?: boolean;
+        hint?: string;
+      };
+
+      if (cancelReport.running !== false || cancelReport.finished !== true) {
+        throw new Error(`(F4) run 2 must be stopped by cancel: ${JSON.stringify(cancelReport)}`);
+      }
+      if (cancelReport.hint !== undefined) {
+        throw new Error(`(F4) cancel must not be ignored (registry retained run 2): ${JSON.stringify(cancelReport)}`);
+      }
+    });
+
+    if (f4Exit !== 0) {
+      throw new Error(`(F4) suite must exit 0, got ${f4Exit}`);
+    }
+
+    console.log(
+      "id reuse ownership guard: first run settlement does not delete second run entry; second run can be cancelled: ok"
+    );
+  } finally {
+    rmSync(f4StateDir, { recursive: true, force: true });
+    try {
+      unlinkSync(f4AgyBin);
+    } catch {
+      /* ignore unlink error */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 9f. Ambiguous cancel hint attached even if newest transcript is finished (F6)
+// ---------------------------------------------------------------------------
+{
+  const f6StateDir = mkdtempSync(path.join(os.tmpdir(), "agy-f6-state-"));
+  const f6AgyBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
+  try {
+    writeFileSync(
+      f6AgyBin,
+      `#!/bin/sh
+sleep 5
+printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"ok","duration_seconds":5}}'
+`
+    );
+    chmodSync(f6AgyBin, 0o755);
+
+    // Create an older finished transcript in the state dir with a future mtime
+    writeFileSync(
+      path.join(f6StateDir, "task_finished_mtime.stream"),
+      "session open · cwd=/work · permission_mode=accept-edits · tools=1\n== done: status=SUCCESS · 1s\n"
+    );
+    const future = new Date(Date.now() + 60_000);
+    utimesSync(path.join(f6StateDir, "task_finished_mtime.stream"), future, future);
+
+    const { exitCode: f6Exit } = await driveMcpStdio(f6AgyBin, f6StateDir, async (io) => {
+      io.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: HANDSHAKE("f6-probe") });
+      io.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await io.waitUntil(() => !!io.responseFor(1), "init f6");
+
+      // Start 2 concurrent delegations in flight
+      io.send({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "run-1", cwd: f6StateDir, background: true } },
+      });
+      io.send({
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: { name: "general_task", arguments: { prompt: "run-2", cwd: f6StateDir, background: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(10) && !!io.responseFor(11), "both handles");
+
+      // Ambiguous cancel: no stream_file, multiple runs in flight, report resolves the finished transcript
+      io.send({
+        jsonrpc: "2.0",
+        id: 12,
+        method: "tools/call",
+        params: { name: "watch_task", arguments: { cancel: true } },
+      });
+      await io.waitUntil(() => !!io.responseFor(12), "ambiguous cancel response");
+      const report12 = JSON.parse(contentText(io.responseFor(12), 12)) as {
+        running?: boolean;
+        finished?: boolean;
+        hint?: string;
+      };
+
+      if (report12.running !== false || report12.finished !== true) {
+        throw new Error(`(F6) report should read finished transcript: ${JSON.stringify(report12)}`);
+      }
+      if (
+        typeof report12.hint !== "string" ||
+        !report12.hint.includes("stream_file") ||
+        (!report12.hint.includes("ambiguous") && !report12.hint.includes("several delegations"))
+      ) {
+        throw new Error(
+          `(F6) ambiguous cancel must attach hint even when report is finished: ${JSON.stringify(report12)}`
+        );
+      }
+    });
+
+    if (f6Exit !== 0) {
+      throw new Error(`(F6) suite must exit 0, got ${f6Exit}`);
+    }
+
+    console.log("ambiguous cancel hint: attached unconditionally even when transcript resolved is finished: ok");
+  } finally {
+    rmSync(f6StateDir, { recursive: true, force: true });
+    try {
+      unlinkSync(f6AgyBin);
+    } catch {
+      /* ignore unlink error */
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
