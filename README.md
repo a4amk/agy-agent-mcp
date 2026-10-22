@@ -209,6 +209,6 @@ npm run lint           # check formatting and lint rules with Biome
 npm run lint:fix       # auto-apply Biome formatting and safe fixes
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the behavioral reference.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup (behavior lives in code and the test suite's summary lines).
 
 MIT, see [LICENSE](LICENSE).

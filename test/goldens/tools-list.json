@@ -4,7 +4,7 @@
       {
         "name": "general_task",
         "title": "Run general-purpose Antigravity sub-agent task",
-        "description": "Delegate a general-purpose coding task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Pass background: true to detach instead: the call returns a task handle immediately and the run keeps going - a detached run emits NO notifications/progress (an MCP progress notification only belongs to a request that is still in flight), so watch_task is the detached run's progress channel. Defaults: mode accept-edits, effort medium (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no --effort is passed for it). The result carries the agent's final response, the resumable conversation_id, token usage, denied_actions, and the git-based files_touched/scope_violations audit when cwd is a git repo. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. File edits inside the task cwd never prompt; set edit_scope so out-of-scope changes are flagged in the audit. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
+        "description": "Delegate coding task to agy sub-agent (accept-edits mode, may edit files). Prompt must be self-contained. Blocks until finished, returning report (status, response, usage, files_touched, transcript paths). Default effort: medium. background: true returns handle immediately (collect with watch_task). conversation_id resumes earlier thread. Headless runs auto-deny gated tools (in denied_actions; auto_approve skips).",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -12,23 +12,23 @@
               "type": "string",
               "minLength": 1,
               "pattern": "\\S",
-              "description": "Full, self-contained task description for the sub-agent. Include all needed context and file paths. Must not be empty or whitespace only."
+              "description": "Self-contained task prompt for sub-agent."
             },
             "conversation_id": {
               "type": "string",
-              "description": "Existing agy conversation ID to continue/resume instead of starting a new conversation. Returned by previous task results."
+              "description": "Existing conversation ID to resume."
             },
             "cwd": {
               "type": "string",
-              "description": "Working directory for the delegated task (project the sub-agent operates on). Defaults to the server's cwd."
+              "description": "Task cwd (defaults to server cwd)."
             },
             "model": {
               "type": "string",
-              "description": "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field). Ids returned by list_models carry their tier (e.g. gemini-3.8-flash-high) and must not be combined with a different effort - the agy CLI rejects that combination. A tier-carrying id takes precedence over the default effort (its tier wins and no --effort is passed for it)."
+              "description": "Model (e.g. gemini-3.8-flash). Tier-carrying id (e.g. gemini-3.8-flash-high) encodes tier and wins over effort; pairing with different effort is refused locally."
             },
             "agent": {
               "type": "string",
-              "description": "Antigravity agent profile to use (see list_agents)"
+              "description": "Agent profile (see list_agents)."
             },
             "effort": {
               "type": "string",
@@ -37,22 +37,22 @@
                 "medium",
                 "high"
               ],
-              "description": "Reasoning effort for the task: low|medium|high (the only levels the available models accept). Applies to a model id that does not carry a tier - a tier-carrying id (e.g. gemini-3.8-flash-high, as returned by list_models) already encodes its tier and takes precedence over this effort."
+              "description": "Effort: low|medium|high (bare models; tier-carrying ids win)."
             },
             "auto_approve": {
               "type": "boolean",
-              "description": "Expert switch: pass --dangerously-skip-permissions so headless runs stop auto-denying gated tools. Pair it with sandbox when granting it. Allowed by this server."
+              "description": "Pass --dangerously-skip-permissions to avoid auto-denying tools. Pair with sandbox."
             },
             "sandbox": {
               "type": "boolean",
-              "description": "Run the task with Antigravity's terminal sandbox flag enabled (--sandbox)"
+              "description": "Terminal sandbox flag (--sandbox)."
             },
             "add_dirs": {
               "type": "array",
               "items": {
                 "type": "string"
               },
-              "description": "Extra directories to add to the task's workspace (--add-dir, repeatable)"
+              "description": "Extra workspace dirs (--add-dir)."
             },
             "edit_scope": {
               "type": "array",
@@ -60,21 +60,21 @@
                 "type": "string"
               },
               "minItems": 1,
-              "description": "Give the sub-agent an edit boundary (files and directories relative to cwd, or absolute). Out-of-scope changes are surfaced in the result's files_touched/scope_violations audit; it is an audit-and-replay control, not a sandbox — the CLI writes files itself."
+              "description": "Allowed edit paths; out-of-scope edits flag in scope_violations."
             },
             "project": {
               "type": "string",
-              "description": "Antigravity project ID or name for the task"
+              "description": "Project ID or name."
             },
             "timeout_ms": {
               "type": "integer",
               "minimum": 0,
               "maximum": 3600000,
-              "description": "Idle timeout for the run in ms (0..3600000; 0 disables the idle kill for this run). Resets on every stdout/stderr chunk from the child; kicks in after this much child silence and kills the child (SIGTERM, then SIGKILL after 5s). Default: 900000 (AGY_MCP_IDLE_TIMEOUT_MS)."
+              "description": "Idle timeout in ms (0..3600000; 0 disables; default 900000)."
             },
             "background": {
               "type": "boolean",
-              "description": "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. A detached run emits NO notifications/progress: MCP progress notifications only apply while the request is in flight, and a detached call has already been answered - watch_task is its progress channel. Default: false."
+              "description": "Run in background; collect with watch_task. Emits no progress notifications."
             }
           },
           "required": [
@@ -90,7 +90,7 @@
       {
         "name": "explore_task",
         "title": "Run read-only Antigravity exploration task",
-        "description": "Delegate a fast read-only exploration and diagnosis task to the Antigravity (agy) CLI and block until the headless run exits (synchronous; the tool call IS the wait). Pass background: true to detach instead: the call returns a task handle immediately and the run keeps going - a detached run emits NO notifications/progress (an MCP progress notification only belongs to a request that is still in flight), so watch_task is the detached run's progress channel. Defaults: mode plan (read-only), effort low (a model id that already carries its tier, e.g. gemini-3.8-flash-high, overrides that default: its tier wins and no --effort is passed for it); the mode preset is fixed, so callers cannot weaken the read-only posture. Produces answers and summaries without modifying files. Returns the same report as general_task, including the git-based files_touched/scope_violations audit. Headless runs auto-DENY tool requests that would prompt instead of hanging (surfaced in denied_actions); permission to allow them is granted by the user via permissions.allow rules in their own Antigravity settings.json (e.g. command(<target>)), which this server never edits. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair it with sandbox when granting it.",
+        "description": "Delegate read-only task to agy sub-agent (plan mode, read-only). Prompt must be self-contained. Blocks until finished, returning report (status, response, usage, files_touched, transcript paths). Default effort: low. background: true returns handle immediately (collect with watch_task). conversation_id resumes earlier thread. Headless runs auto-deny gated tools (in denied_actions; auto_approve skips).",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -98,23 +98,23 @@
               "type": "string",
               "minLength": 1,
               "pattern": "\\S",
-              "description": "Full, self-contained task description for the sub-agent. Include all needed context and file paths. Must not be empty or whitespace only."
+              "description": "Self-contained task prompt for sub-agent."
             },
             "conversation_id": {
               "type": "string",
-              "description": "Existing agy conversation ID to continue/resume instead of starting a new conversation. Returned by previous task results."
+              "description": "Existing conversation ID to resume."
             },
             "cwd": {
               "type": "string",
-              "description": "Working directory for the delegated task (project the sub-agent operates on). Defaults to the server's cwd."
+              "description": "Task cwd (defaults to server cwd)."
             },
             "model": {
               "type": "string",
-              "description": "Model for the task, e.g. gemini-3.8-flash (pair it with the effort field). Ids returned by list_models carry their tier (e.g. gemini-3.8-flash-high) and must not be combined with a different effort - the agy CLI rejects that combination. A tier-carrying id takes precedence over the default effort (its tier wins and no --effort is passed for it)."
+              "description": "Model (e.g. gemini-3.8-flash). Tier-carrying id (e.g. gemini-3.8-flash-high) encodes tier and wins over effort; pairing with different effort is refused locally."
             },
             "agent": {
               "type": "string",
-              "description": "Antigravity agent profile to use (see list_agents)"
+              "description": "Agent profile (see list_agents)."
             },
             "effort": {
               "type": "string",
@@ -123,22 +123,22 @@
                 "medium",
                 "high"
               ],
-              "description": "Reasoning effort for the task: low|medium|high (the only levels the available models accept). Applies to a model id that does not carry a tier - a tier-carrying id (e.g. gemini-3.8-flash-high, as returned by list_models) already encodes its tier and takes precedence over this effort."
+              "description": "Effort: low|medium|high (bare models; tier-carrying ids win)."
             },
             "auto_approve": {
               "type": "boolean",
-              "description": "Expert switch: pass --dangerously-skip-permissions so headless runs stop auto-denying gated tools. Pair it with sandbox when granting it. Allowed by this server."
+              "description": "Pass --dangerously-skip-permissions to avoid auto-denying tools. Pair with sandbox."
             },
             "sandbox": {
               "type": "boolean",
-              "description": "Run the task with Antigravity's terminal sandbox flag enabled (--sandbox)"
+              "description": "Terminal sandbox flag (--sandbox)."
             },
             "add_dirs": {
               "type": "array",
               "items": {
                 "type": "string"
               },
-              "description": "Extra directories to add to the task's workspace (--add-dir, repeatable)"
+              "description": "Extra workspace dirs (--add-dir)."
             },
             "edit_scope": {
               "type": "array",
@@ -146,21 +146,21 @@
                 "type": "string"
               },
               "minItems": 1,
-              "description": "Give the sub-agent an edit boundary (files and directories relative to cwd, or absolute). Out-of-scope changes are surfaced in the result's files_touched/scope_violations audit; it is an audit-and-replay control, not a sandbox — the CLI writes files itself."
+              "description": "Allowed edit paths; out-of-scope edits flag in scope_violations."
             },
             "project": {
               "type": "string",
-              "description": "Antigravity project ID or name for the task"
+              "description": "Project ID or name."
             },
             "timeout_ms": {
               "type": "integer",
               "minimum": 0,
               "maximum": 3600000,
-              "description": "Idle timeout for the run in ms (0..3600000; 0 disables the idle kill for this run). Resets on every stdout/stderr chunk from the child; kicks in after this much child silence and kills the child (SIGTERM, then SIGKILL after 5s). Default: 900000 (AGY_MCP_IDLE_TIMEOUT_MS)."
+              "description": "Idle timeout in ms (0..3600000; 0 disables; default 900000)."
             },
             "background": {
               "type": "boolean",
-              "description": "When true, start the task headlessly in the background and return immediately with a task handle. Poll watch_task to follow progress and retrieve the final result. A detached run emits NO notifications/progress: MCP progress notifications only apply while the request is in flight, and a detached call has already been answered - watch_task is its progress channel. Default: false."
+              "description": "Run in background; collect with watch_task. Emits no progress notifications."
             }
           },
           "required": [
@@ -176,24 +176,28 @@
       {
         "name": "watch_task",
         "title": "Watch live or recent task stream transcript",
-        "description": "Tails a task's live stream transcript. No args = latest run. Call it while a general_task/explore_task is in flight (this or any session) to watch the sub-agent work; it is also the progress channel for a detached (background: true) run, which never emits notifications/progress. The returned 'running' field plus 'modified' tell a live run from an abandoned one. For a live feed prefer the compact digest: 'steps' (a bounded window over the 50 MOST RECENT steps, oldest first - one entry per read/write/run/phase with its target, duration and token cost), 'step_count' (the TOTAL number of steps, so step_count > steps.length means the digest was clipped), 'phase', 'elapsed_seconds' and 'usage_latest'. 'content' is the raw transcript tail - read it for detail, not for a status display. Once the run ends, the report carries the COMPLETE final result - the durable receipt's every field, the same result general_task/explore_task returns, so a failed run reports WHY it failed; 'result_ready' says the durable receipt has it. 'hint' carries a note for the caller when the report needs one - e.g. a cancel that was IGNORED because the run is owned by another server process.",
+        "description": "Read transcript tail of an agy run (snapshot, not follow; no args = latest run). Digest: steps (50 most recent), step_count (total; step_count > steps.length means clipped), phase, elapsed_seconds, usage_latest, content (raw tail). Finished runs carry complete final result (failed run says why). wait: true blocks until finished in one call (not combinable with cancel; cannot await foreign run). cancel: true stops owned run (foreign/ambiguous reported ignored with hint).",
         "inputSchema": {
           "type": "object",
           "properties": {
             "stream_file": {
               "type": "string",
               "minLength": 1,
-              "description": "Stream transcript to read. Omit for the latest task_<id>.stream in AGY_MCP_STATE_DIR. Accepted forms: an absolute path under AGY_MCP_STATE_DIR, a bare file name like \"task_f8870173.stream\", or a task id like \"task_f8870173\" / \"f8870173\"."
+              "description": "Transcript or task ID. Omit for latest run."
             },
             "tail_lines": {
               "type": "integer",
               "minimum": 0,
               "maximum": 2000,
-              "description": "Number of trailing lines to return (1..2000, default 400; 0 returns the full transcript, hard-capped at 200,000 chars)."
+              "description": "Trailing lines (1..2000, default 400; 0 returns all, capped at 200k chars)."
             },
             "cancel": {
               "type": "boolean",
-              "description": "When true and the watched task is still running, stop that run immediately (kill the child process, release the delegation lock, and report the run as cancelled)."
+              "description": "Stop running task owned by this process and report cancelled."
+            },
+            "wait": {
+              "type": "boolean",
+              "description": "Block until finished and return result in one call. Incompatible with cancel; cannot await foreign run."
             }
           },
           "additionalProperties": false,
@@ -206,7 +210,7 @@
       {
         "name": "list_models",
         "title": "List available agy models",
-        "description": "List model IDs usable for the `model` parameter of delegation tools. The raw `agy models` output is returned in `models` and the parsed IDs in `model_ids` (a line of the CLI output is an id when it contains a TAB; the id is the text before it). A failing `agy models` (missing binary, non-zero exit, timeout) is reported as an error - `isError: true` with an `error` naming the command and the failure - never as a model list.",
+        "description": "List models for model argument. Returns models (raw agy models output) and model_ids (parsed ids). CLI lists tier-carrying ids only; bare ids like gemini-3.8-flash are valid for model but not in list.",
         "inputSchema": {
           "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",
@@ -220,7 +224,7 @@
       {
         "name": "list_agents",
         "title": "List available agy agents",
-        "description": "List agent profiles usable for the `agent` parameter of delegation tools. A failing `agy agents` (missing binary, non-zero exit, timeout) is reported as an error - `isError: true` with an `error` naming the command and the failure - never as an agent list.",
+        "description": "List agent profiles for agent argument. Returns agents (raw agy agents output). Empty output means no custom agent configured.",
         "inputSchema": {
           "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",

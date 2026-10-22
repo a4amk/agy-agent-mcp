@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Rewrote tool descriptions for LLMs**: descriptions across all five tools and schemas are rewritten in concise, plain language focused on tool selection and argument filling, roughly halving the `tools/list` context payload (~13 KB down to under 6.5 KB). Per-field documentation on `TaskResult` and machine-checked pointers in `CONTRIBUTING.md` replace the redundant prose behavioral reference.
 - **Added `watch_task(wait: true)` to collect a run in one call**: opt-in parameter that awaits settlement of a detached (`background: true`) run and returns its complete final result in a single call without polling round trips.
 - `watch_task(wait: true)` returns immediately on an already finished run, awaits in-flight runs owned by this process via the delegations registry, and refuses runs in flight owned by another server process with an informative error envelope directing callers to poll.
 - `watch_task` refuses the combination of `cancel: true` and `wait: true` as contradictory and redundant.

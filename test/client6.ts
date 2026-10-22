@@ -1246,40 +1246,6 @@ console.log("protocol parity vs test/goldens (bin -> dist): starting");
         );
       }
     }
-    if (s.golden === "tools-list") {
-      const goldenTools = (
-        golden.result as {
-          tools?: Array<{
-            name: string;
-            description: string;
-            inputSchema: { properties: Record<string, unknown>; additionalProperties: boolean };
-          }>;
-        }
-      )?.tools;
-      const watchTool = goldenTools?.find((t) => t.name === "watch_task");
-      const respTools = (
-        resp?.result as {
-          tools?: Array<{
-            name: string;
-            description: string;
-            inputSchema: { properties: Record<string, unknown>; additionalProperties: boolean };
-          }>;
-        }
-      )?.tools;
-      const respWatch = respTools?.find((t) => t.name === "watch_task");
-      if (watchTool && respWatch) {
-        const oldKeys = Object.keys(watchTool.inputSchema.properties);
-        const newKeys = Object.keys(respWatch.inputSchema.properties);
-        if (newKeys.length !== oldKeys.length + 1 || !newKeys.includes("wait")) {
-          throw new Error(`watch_task inputSchema must add exactly the wait property: ${JSON.stringify(newKeys)}`);
-        }
-        if (respWatch.inputSchema.additionalProperties !== false) {
-          throw new Error("watch_task inputSchema must keep additionalProperties: false");
-        }
-        watchTool.description = respWatch.description;
-        watchTool.inputSchema = respWatch.inputSchema;
-      }
-    }
     if (!jsonDeepEqual(resp, golden)) {
       throw new Error(
         `response for ${s.golden} deviates from the golden:\n  got:    ${JSON.stringify(resp)}\n  golden: ${JSON.stringify(golden)}`
