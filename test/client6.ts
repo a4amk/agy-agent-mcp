@@ -2493,7 +2493,7 @@ const HANDSHAKE = (clientName: string) => ({
   try {
     writeFileSync(
       fbBin,
-      [
+      `${[
         "#!/bin/sh",
         "(",
         "  sleep 2.5",
@@ -2502,7 +2502,7 @@ const HANDSHAKE = (clientName: string) => ({
         `echo "$!" > "${path.join(fbDir, "descendant.pid")}"`,
         `printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"quick","duration_seconds":0.1}}'`,
         "exit 0",
-      ].join("\n") + "\n"
+      ].join("\n")}\n`
     );
     chmodSync(fbBin, 0o755);
 
@@ -2551,7 +2551,7 @@ const HANDSHAKE = (clientName: string) => ({
   const cancelAgyBin = path.join(tmpBase, `fake-agy-${fakeCounter++}`);
   writeFileSync(
     cancelAgyBin,
-    ["#!/bin/sh", `printf '%s\\n' "$$" > "${cancelPidfile}"`, SLOW_STREAM_BODY].join("\n") + "\n"
+    `${["#!/bin/sh", `printf '%s\\n' "$$" > "${cancelPidfile}"`, SLOW_STREAM_BODY].join("\n")}\n`
   );
   chmodSync(cancelAgyBin, 0o755);
 
@@ -2656,12 +2656,12 @@ const HANDSHAKE = (clientName: string) => ({
   try {
     writeFileSync(
       quickBin,
-      [
+      `${[
         "#!/bin/sh",
         argCap,
         `printf '%s\\n' '{"event":"init","conversation_id":"f-quick","init":{"cwd":"/work","tools":[],"permission_mode":"plan"}}'`,
         `printf '%s\\n' '{"event":"result","result":{"conversation_id":"f-quick","status":"SUCCESS","response":"ok","duration_seconds":0.1}}'`,
-      ].join("\n") + "\n"
+      ].join("\n")}\n`
     );
     chmodSync(quickBin, 0o755);
 
