@@ -13,10 +13,10 @@
  * _meta.progressToken - only while that request is still in flight, so a
  * detached (background: true) run emits none and is followed through
  * watch_task instead;
- * delegations are single-flight — a second general_task/explore_task while one
- * runs is rejected, not queued. When the client disconnects, a DETACHED
- * (background: true) run is finished first — the server lingers until it ends,
- * writes its receipt and only then exits, so the result survives the client —
+ * any number of delegations may run concurrently; each is an independent child
+ * process with its own transcript and result. When the client disconnects, DETACHED
+ * (background: true) runs are finished first — the server lingers until they end,
+ * writes their receipts and only then exits, so results survive the client —
  * while an abandoned foreground call is killed as before.
  * Run: `npm run build` then
  * `node dist/index.js` (bin/mcp.mjs wraps this; npm installs need compiled
@@ -83,6 +83,18 @@ interface Schema {
   additionalProperties?: boolean;
 }
 
+type JsonRpcId = string | number;
+
+interface ActiveDelegation {
+  tool: string;
+  requestId: JsonRpcId;
+  taskId?: string;
+  streamPath?: string;
+  abort?: () => void;
+  detached?: boolean;
+  promise?: Promise<unknown>;
+}
+
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
   isError: boolean;
@@ -93,7 +105,7 @@ interface ToolSpec {
   title: string;
   description: string;
   inputSchema: Schema;
-  handler: (args: Args, params: Args, signal?: AbortSignal) => Promise<ToolResult>;
+  handler: (args: Args, params: Args, signal?: AbortSignal, entry?: ActiveDelegation) => Promise<ToolResult>;
 }
 
 const DELEGATION_INPUT_SCHEMA: Schema = {
@@ -452,50 +464,18 @@ function textResult(value: unknown, isError = false): ToolResult {
 }
 
 // ---------------------------------------------------------------------------
-// Single-flight delegation lock + notifications/progress bridge
+// Concurrent delegations registry + notifications/progress bridge
 // ---------------------------------------------------------------------------
 
 const DELEGATION_TOOLS = new Set(["general_task", "explore_task"]);
 
 /**
- * At most one delegation may run at a time (the tool call IS the wait, so a
- * blocked caller already serializes itself per session); a second
- * general_task/explore_task arriving while one runs is rejected immediately —
- * not queued — while watch_task, list_models, list_agents, and ping are never
- * blocked. taskId/streamPath are filled by the runner's onTaskStart hook so a
- * rejection can point at the live run before anything streams.
+ * Any number of delegations may run concurrently. In-flight delegations are
+ * tracked in a module-level registry keyed by request id so they are visible
+ * to the cancellation and drain paths. taskId/streamPath are filled by the
+ * runner's onTaskStart hook.
  */
-let activeDelegation: {
-  tool: string;
-  requestId: JsonRpcId;
-  taskId?: string;
-  streamPath?: string;
-  abort?: () => void;
-  detached?: boolean;
-  promise?: Promise<unknown>;
-} | null = null;
-
-/**
- * House tool-error envelope naming the in-flight run (or the tool if it has
- * not reported a task yet).
- *
- * The rejection uses the same shape as every other refusal in this server: a
- * single `{"error": "..."}` key with `isError: true`. A caller that parses the
- * body as JSON therefore gets a message, not a parse error.
- */
-function delegationRejectedResult(): ToolResult {
-  const running = activeDelegation;
-  const detail =
-    running?.taskId && running.streamPath
-      ? `task ${running.taskId}, stream ${running.streamPath}`
-      : `tool ${running?.tool ?? "delegation"}`;
-  return textResult(
-    {
-      error: `another delegation is already running (${detail}); one agent at a time - retry after it completes`,
-    },
-    true
-  );
-}
+const delegations = new Map<JsonRpcId, ActiveDelegation>();
 
 /** notifications/progress emissions for a delegation are coalesced to this window. */
 const PROGRESS_COALESCE_MS = 200;
@@ -614,14 +594,15 @@ function progressBridgeFor(token: string | number) {
  * Shared delegation path behind general_task / explore_task: builds the runner
  * options, wires the progress bridge only when the request carried a
  * _meta.progressToken AND the call stays in flight, and flushes the bridge
- * synchronously in finally. The single-flight lock was already engaged by the
+ * synchronously in finally. The delegation entry was already registered by the
  * dispatcher before this runs.
  */
 async function runDelegation(
   args: Args,
   params: Args,
   presets: { mode?: TaskOptions["mode"]; effort?: TaskOptions["effort"] },
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  entry?: ActiveDelegation
 ): Promise<ToolResult> {
   let opts: TaskOptions;
   let background: boolean;
@@ -680,9 +661,9 @@ async function runDelegation(
   } = { receipt: null };
 
   opts.onTaskStart = (taskId, streamPath, transcriptPath) => {
-    if (activeDelegation) {
-      activeDelegation.taskId = taskId;
-      activeDelegation.streamPath = streamPath;
+    if (entry) {
+      entry.taskId = taskId;
+      entry.streamPath = streamPath;
     }
     const transcript = transcriptPath ?? streamPath.replace(/\.stream$/, ".ndjson");
     started.receipt = {
@@ -706,11 +687,10 @@ async function runDelegation(
   if (background) {
     try {
       const runPromise = runTask(opts);
-      if (activeDelegation) {
-        activeDelegation.detached = true;
-        activeDelegation.promise = runPromise;
+      if (entry) {
+        entry.detached = true;
+        entry.promise = runPromise;
       }
-      const taskId = started.receipt ? started.receipt.task_id : activeDelegation?.taskId;
       runPromise
         .then((result) => {
           if (bridge) result.progress_bridge = bridge.stats();
@@ -721,8 +701,8 @@ async function runDelegation(
         })
         .finally(() => {
           bridge?.finish();
-          if (activeDelegation?.taskId === taskId) {
-            activeDelegation = null;
+          if (entry) {
+            delegations.delete(entry.requestId);
           }
         });
 
@@ -735,15 +715,17 @@ async function runDelegation(
       if (bridge) result.progress_bridge = bridge.stats();
       return textResult(result, result.status !== "success");
     } catch (err) {
-      if (activeDelegation) activeDelegation = null;
+      if (entry) {
+        delegations.delete(entry.requestId);
+      }
       return textResult({ error: (err as Error).message }, true);
     }
   }
 
   try {
     const runPromise = runTask(opts);
-    if (activeDelegation) {
-      activeDelegation.promise = runPromise;
+    if (entry) {
+      entry.promise = runPromise;
     }
     const result = await runPromise;
     // The receipt says whether the client asked for progress and how much was
@@ -791,17 +773,19 @@ function discoveryFailure(command: string, result: CmdResult): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The note a `watch_task(cancel: true)` report carries when the cancel could
- * NOT be honoured. The cancel path acts on the module-level
- * `activeDelegation` - the delegation THIS process owns - so a run owned by
- * another server process cannot be stopped from here. The report says so
- * instead of leaving the caller with a bare `running: true` that looks like a
- * working cancel.
+ * The notes a `watch_task(cancel: true)` report carries when the cancel could
+ * NOT be honoured: either the run is not owned by this process (foreign run),
+ * or multiple delegations are in flight and the caller did not specify which
+ * run to cancel.
  */
 const CANCEL_IGNORED_HINT =
   "The cancel request was IGNORED: the run is still in flight, but it is not owned by this server " +
   "process - another server process started it, and only that process can cancel it (this server " +
   "has no cross-process cancel).";
+
+const CANCEL_AMBIGUOUS_HINT =
+  "The cancel request was IGNORED: several delegations are in flight (target is ambiguous) - " +
+  "pass stream_file to name the run to cancel.";
 
 const TOOLS: ToolSpec[] = [
   {
@@ -824,8 +808,8 @@ const TOOLS: ToolSpec[] = [
       "edit_scope so out-of-scope changes are flagged in the audit. auto_approve is the expert full-auto switch " +
       "(--dangerously-skip-permissions); pair it with sandbox when granting it.",
     inputSchema: DELEGATION_INPUT_SCHEMA,
-    handler: async (args, params, signal) =>
-      runDelegation(args, params, { mode: "accept-edits", effort: "medium" }, signal),
+    handler: async (args, params, signal, entry) =>
+      runDelegation(args, params, { mode: "accept-edits", effort: "medium" }, signal, entry),
   },
   {
     name: "explore_task",
@@ -846,7 +830,8 @@ const TOOLS: ToolSpec[] = [
       "server never edits. auto_approve is the expert full-auto switch (--dangerously-skip-permissions); pair " +
       "it with sandbox when granting it.",
     inputSchema: DELEGATION_INPUT_SCHEMA,
-    handler: async (args, params, signal) => runDelegation(args, params, { mode: "plan", effort: "low" }, signal),
+    handler: async (args, params, signal, entry) =>
+      runDelegation(args, params, { mode: "plan", effort: "low" }, signal, entry),
   },
   {
     name: "watch_task",
@@ -877,52 +862,59 @@ const TOOLS: ToolSpec[] = [
         const tailLines = intArg(args, "tail_lines", 0, 2000);
         const cancel = boolArg(args, "cancel") ?? false;
         // A cancel this process cannot honour must be VISIBLE. The cancel path
-        // acts on the module-level `activeDelegation` - the delegation THIS
-        // process owns - so a run started by another server process is out of
-        // reach. `cancelIgnored` records that the request did nothing; the
-        // report then says so in its `hint` instead of leaving the caller
-        // with a bare `running: true` it cannot act on.
+        // acts on the in-flight delegations THIS process owns — so a run started
+        // by another server process is out of reach, and multiple runs without a
+        // stream_file target are ambiguous. `cancelIgnored` records that the request
+        // did nothing; the report then says so in its `hint` instead of leaving the
+        // caller with a bare `running: true` it cannot act on.
         let cancelIgnored = false;
+        let cancelHint: string | undefined;
         if (cancel) {
-          if (activeDelegation) {
-            let shouldCancel = false;
-            if (!streamFile) {
-              shouldCancel = true;
-            } else {
-              const resolved = resolveStreamFile(STATE_DIR, streamFile);
-              if (!("error" in resolved)) {
+          let target: ActiveDelegation | undefined;
+          if (streamFile) {
+            const resolved = resolveStreamFile(STATE_DIR, streamFile);
+            if (!("error" in resolved)) {
+              for (const d of delegations.values()) {
                 if (
-                  activeDelegation.streamPath === resolved.path ||
-                  activeDelegation.taskId === streamFile ||
-                  (activeDelegation.taskId && resolved.path.includes(activeDelegation.taskId))
+                  d.streamPath === resolved.path ||
+                  d.taskId === streamFile ||
+                  (d.taskId && resolved.path.includes(d.taskId))
                 ) {
-                  shouldCancel = true;
+                  target = d;
+                  break;
                 }
               }
             }
-            if (shouldCancel) {
-              try {
-                activeDelegation.abort?.();
-              } catch {
-                /* abort callback error swallowed */
-              }
-              if (activeDelegation.promise) {
-                try {
-                  await activeDelegation.promise;
-                } catch {
-                  /* promise rejection swallowed */
-                }
-              }
-              activeDelegation = null;
-            } else {
-              // The delegation in flight HERE is a different run than the one
-              // the caller asked to stop.
+            if (!target) {
               cancelIgnored = true;
+              cancelHint = CANCEL_IGNORED_HINT;
             }
           } else {
-            // No delegation in flight in THIS process: a run that is still
-            // running was started by another server process, which owns it.
-            cancelIgnored = true;
+            if (delegations.size === 1) {
+              target = delegations.values().next().value;
+            } else if (delegations.size > 1) {
+              cancelIgnored = true;
+              cancelHint = CANCEL_AMBIGUOUS_HINT;
+            } else {
+              cancelIgnored = true;
+              cancelHint = CANCEL_IGNORED_HINT;
+            }
+          }
+
+          if (target) {
+            try {
+              target.abort?.();
+            } catch {
+              /* abort callback error swallowed */
+            }
+            if (target.promise) {
+              try {
+                await target.promise;
+              } catch {
+                /* promise rejection swallowed */
+              }
+            }
+            delegations.delete(target.requestId);
           }
         }
         // The cancel path above already acted on the in-flight delegation;
@@ -935,7 +927,7 @@ const TOOLS: ToolSpec[] = [
         // still in flight: a finished run has nothing left to cancel
         // (`finished: true` already says so).
         if (cancelIgnored && report.running === true) {
-          report.hint = CANCEL_IGNORED_HINT;
+          report.hint = cancelHint ?? CANCEL_IGNORED_HINT;
         }
         return textResult(report);
       } catch (err) {
@@ -1007,8 +999,6 @@ const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t] as const));
 // JSON-RPC plumbing (newline-delimited 2.0 over stdio)
 // ---------------------------------------------------------------------------
 
-type JsonRpcId = string | number;
-
 function asObject(value: unknown): Args {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Args) : {};
 }
@@ -1057,24 +1047,26 @@ function toolsCall(params: Args, id: JsonRpcId): void | Promise<void> {
       isError: true,
     });
   }
-  // Single-flight delegation lock, engaged at dispatch entry: a second
-  // general_task/explore_task is rejected immediately (not queued), while
-  // watch_task / list_models / list_agents / ping never touch it.
+  // Concurrent delegations: every delegation call is accepted and registered
+  // under its JSON-RPC request id, while watch_task / list_models /
+  // list_agents / ping never touch the registry.
   const isDelegation = DELEGATION_TOOLS.has(name);
   let abortController: AbortController | undefined;
+  let entry: ActiveDelegation | undefined;
   if (isDelegation) {
-    if (activeDelegation !== null) {
-      return respond(id, delegationRejectedResult());
-    }
     abortController = new AbortController();
-    activeDelegation = {
+    entry = {
       tool: name,
       requestId: id,
       abort: () => abortController?.abort(),
     };
+    delegations.set(id, entry);
+    if (delegations.size > 1) {
+      process.stderr.write(`[${SERVER_NAME}] ${delegations.size} delegations in flight\n`);
+    }
   }
   return tool
-    .handler(asObject(params.arguments), params, abortController?.signal)
+    .handler(asObject(params.arguments), params, abortController?.signal, entry)
     .then(
       (result) => respond(id, result),
       // Tool handlers catch their own runner errors; this arm is the defensive
@@ -1088,8 +1080,9 @@ function toolsCall(params: Args, id: JsonRpcId): void | Promise<void> {
     )
     .finally(() => {
       // Released in finally so timeout kills and run errors release it too.
-      if (isDelegation && activeDelegation?.requestId === id && !activeDelegation.detached) {
-        activeDelegation = null;
+      // Detached runs keep their entry until the run itself ends.
+      if (isDelegation && entry && !entry.detached) {
+        delegations.delete(id);
       }
     });
 }
@@ -1141,17 +1134,16 @@ function handleMessage(line: string): void {
   if (msg.method === "notifications/cancelled") {
     const cancelParams = asObject(msg.params);
     const reqId = cancelParams.requestId;
-    if (
-      (typeof reqId === "string" || (typeof reqId === "number" && Number.isInteger(reqId))) &&
-      activeDelegation !== null &&
-      activeDelegation.requestId === reqId
-    ) {
-      try {
-        activeDelegation.abort?.();
-      } catch {
-        /* abort callback error swallowed */
+    if (typeof reqId === "string" || (typeof reqId === "number" && Number.isInteger(reqId))) {
+      const target = delegations.get(reqId);
+      if (target) {
+        try {
+          target.abort?.();
+        } catch {
+          /* abort callback error swallowed */
+        }
+        delegations.delete(reqId);
       }
-      activeDelegation = null;
     }
     return;
   }
@@ -1200,14 +1192,19 @@ process.stdin.on("error", ignoreStdinError);
 let shutdownStarted = false;
 
 /**
- * Wait for the in-flight DETACHED run to finish so its receipt is written
+ * Wait for any in-flight DETACHED runs to finish so their receipts are written
  * before the server leaves. A no-op when no detached run is in flight: a
  * foreground call is abandoned instead (its child is killed by
  * shutdownRunner - nobody would read the answer anyway).
  */
 async function drainDetachedRun(): Promise<void> {
-  const detached = activeDelegation?.detached ? activeDelegation.promise : undefined;
-  if (!detached) return;
+  const detachedPromises: Promise<unknown>[] = [];
+  for (const d of delegations.values()) {
+    if (d.detached && d.promise) {
+      detachedPromises.push(d.promise);
+    }
+  }
+  if (detachedPromises.length === 0) return;
   try {
     process.stderr.write(
       `[${SERVER_NAME}] client gone: waiting for the detached run to finish so its receipt is written\n`
@@ -1216,9 +1213,9 @@ async function drainDetachedRun(): Promise<void> {
     /* the client is gone - the log line is a nicety, not a contract */
   }
   try {
-    await detached;
+    await Promise.all(detachedPromises);
   } catch {
-    /* the run's own failure is recorded in its receipt */
+    /* the runs' own failures are recorded in their receipts */
   }
 }
 

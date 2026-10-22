@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Concurrent delegations are now allowed**: any number of `general_task` and `explore_task` calls may run concurrently; a second delegation is no longer refused (`another delegation is already running` is removed).
+- Each concurrent run executes as an independent child process with its own transcript file and final result.
+- `watch_task(cancel: true)` now acts on the run named by the caller via `stream_file` or task ID; cancelling without `stream_file` when multiple runs are in flight is safely ignored with an ambiguity hint.
+- The shutdown drain now awaits every in-flight detached (`background: true`) run on client disconnect so every receipt is written.
+
 
 ## 0.3.0 - 2026-10-21
 
