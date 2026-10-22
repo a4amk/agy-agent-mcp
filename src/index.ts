@@ -42,6 +42,7 @@ import {
   shutdownRunner,
   sweepStateDir,
   type TaskOptions,
+  type TaskResult,
   watchTask,
 } from "./agy.ts";
 
@@ -85,6 +86,8 @@ interface Schema {
 
 type JsonRpcId = string | number;
 
+type McpTaskResult = TaskResult & { audit_note?: string };
+
 interface ActiveDelegation {
   tool: string;
   requestId: JsonRpcId;
@@ -93,6 +96,9 @@ interface ActiveDelegation {
   abort?: () => void;
   detached?: boolean;
   promise?: Promise<unknown>;
+  cwd?: string;
+  sharedTree?: boolean;
+  cwdCountDecremented?: boolean;
 }
 
 interface ToolResult {
@@ -477,6 +483,46 @@ const DELEGATION_TOOLS = new Set(["general_task", "explore_task"]);
  */
 const delegations = new Map<JsonRpcId, ActiveDelegation>();
 
+/**
+ * Note attached to a delegation result when another concurrent delegation
+ * shared the same working tree during its execution.
+ */
+const AUDIT_NOTE_SHARED =
+  "The working tree was shared with another delegation: files_touched and scope_violations may " +
+  "include changes from other concurrent runs and must not be read as this run's alone.";
+
+/**
+ * Number of active delegations in flight per resolved task cwd. A delegation
+ * whose cwd's counter was ever > 1 while it was running had its tree shared.
+ */
+const cwdActiveCounts = new Map<string, number>();
+
+function registerDelegationCwd(entry: ActiveDelegation, cwd: string): void {
+  entry.cwd = cwd;
+  const count = (cwdActiveCounts.get(cwd) ?? 0) + 1;
+  cwdActiveCounts.set(cwd, count);
+  if (count > 1) {
+    entry.sharedTree = true;
+    for (const d of delegations.values()) {
+      if (d.cwd === cwd) {
+        d.sharedTree = true;
+      }
+    }
+  }
+}
+
+function decrementCwdCount(entry?: ActiveDelegation): void {
+  if (entry?.cwd && !entry.cwdCountDecremented) {
+    entry.cwdCountDecremented = true;
+    const count = (cwdActiveCounts.get(entry.cwd) ?? 1) - 1;
+    if (count <= 0) {
+      cwdActiveCounts.delete(entry.cwd);
+    } else {
+      cwdActiveCounts.set(entry.cwd, count);
+    }
+  }
+}
+
 /** notifications/progress emissions for a delegation are coalesced to this window. */
 const PROGRESS_COALESCE_MS = 200;
 /** Every mirrored line inside a progress message is clipped to this many chars. */
@@ -621,6 +667,10 @@ async function runDelegation(
     // client is already answered with a handle, so the run is worth
     // finishing. The runner keeps that child out of the disconnect reaping.
     opts.detached = background;
+    if (entry) {
+      const taskCwd = path.resolve(opts.cwd || process.cwd());
+      registerDelegationCwd(entry, taskCwd);
+    }
   } catch (err) {
     return textResult({ error: (err as Error).message }, true);
   }
@@ -694,6 +744,7 @@ async function runDelegation(
       runPromise
         .then((result) => {
           if (bridge) result.progress_bridge = bridge.stats();
+          if (entry?.sharedTree) (result as McpTaskResult).audit_note = AUDIT_NOTE_SHARED;
           return result;
         })
         .catch((err) => {
@@ -702,7 +753,10 @@ async function runDelegation(
         .finally(() => {
           bridge?.finish();
           if (entry) {
-            delegations.delete(entry.requestId);
+            if (delegations.get(entry.requestId) === entry) {
+              delegations.delete(entry.requestId);
+            }
+            decrementCwdCount(entry);
           }
         });
 
@@ -713,10 +767,14 @@ async function runDelegation(
       }
       const result = await runPromise;
       if (bridge) result.progress_bridge = bridge.stats();
+      if (entry?.sharedTree) (result as McpTaskResult).audit_note = AUDIT_NOTE_SHARED;
       return textResult(result, result.status !== "success");
     } catch (err) {
       if (entry) {
-        delegations.delete(entry.requestId);
+        if (delegations.get(entry.requestId) === entry) {
+          delegations.delete(entry.requestId);
+        }
+        decrementCwdCount(entry);
       }
       return textResult({ error: (err as Error).message }, true);
     }
@@ -732,6 +790,7 @@ async function runDelegation(
     // streamed, so "the server streamed but the client showed nothing" is
     // distinguishable from "the client never opted in".
     if (bridge) result.progress_bridge = bridge.stats();
+    if (entry?.sharedTree) (result as McpTaskResult).audit_note = AUDIT_NOTE_SHARED;
     // A failed delegation is a failed tool call: the envelope says so, so an
     // orchestrating agent that keys off isError does not read a failed run as
     // a success. The background path above already reports it the same way.
@@ -869,8 +928,9 @@ const TOOLS: ToolSpec[] = [
         // caller with a bare `running: true` it cannot act on.
         let cancelIgnored = false;
         let cancelHint: string | undefined;
+        let isAmbiguousCancel = false;
+        let target: ActiveDelegation | undefined;
         if (cancel) {
-          let target: ActiveDelegation | undefined;
           if (streamFile) {
             const resolved = resolveStreamFile(STATE_DIR, streamFile);
             if (!("error" in resolved)) {
@@ -895,6 +955,7 @@ const TOOLS: ToolSpec[] = [
             } else if (delegations.size > 1) {
               cancelIgnored = true;
               cancelHint = CANCEL_AMBIGUOUS_HINT;
+              isAmbiguousCancel = true;
             } else {
               cancelIgnored = true;
               cancelHint = CANCEL_IGNORED_HINT;
@@ -914,19 +975,27 @@ const TOOLS: ToolSpec[] = [
                 /* promise rejection swallowed */
               }
             }
-            delegations.delete(target.requestId);
+            if (delegations.get(target.requestId) === target) {
+              delegations.delete(target.requestId);
+            }
+            decrementCwdCount(target);
           }
         }
+        // F3: When the cancel resolved a target and the caller passed no stream_file,
+        // watch the target's transcript (target.streamPath).
+        const watchStreamTarget = !streamFile && target?.streamPath ? target.streamPath : streamFile;
         // The cancel path above already acted on the in-flight delegation;
         // watchTask only reads the transcript (it has no cancel option).
         const report = watchTask({
-          streamFile,
+          streamFile: watchStreamTarget,
           tailLines,
         });
-        // The hint says the cancel did nothing - but only while the run is
-        // still in flight: a finished run has nothing left to cancel
-        // (`finished: true` already says so).
-        if (cancelIgnored && report.running === true) {
+        // F6: The ambiguous-cancel hint is always attached when the cancel was ignored
+        // for ambiguity (the delegations are still in flight by definition).
+        // For the not-owned-by-this-process hint, keep the existing running gate.
+        if (isAmbiguousCancel) {
+          report.hint = CANCEL_AMBIGUOUS_HINT;
+        } else if (cancelIgnored && report.running === true) {
           report.hint = cancelHint ?? CANCEL_IGNORED_HINT;
         }
         return textResult(report);
@@ -1082,7 +1151,10 @@ function toolsCall(params: Args, id: JsonRpcId): void | Promise<void> {
       // Released in finally so timeout kills and run errors release it too.
       // Detached runs keep their entry until the run itself ends.
       if (isDelegation && entry && !entry.detached) {
-        delegations.delete(id);
+        if (delegations.get(id) === entry) {
+          delegations.delete(id);
+        }
+        decrementCwdCount(entry);
       }
     });
 }
@@ -1142,7 +1214,6 @@ function handleMessage(line: string): void {
         } catch {
           /* abort callback error swallowed */
         }
-        delegations.delete(reqId);
       }
     }
     return;
@@ -1213,7 +1284,7 @@ async function drainDetachedRun(): Promise<void> {
     /* the client is gone - the log line is a nicety, not a contract */
   }
   try {
-    await Promise.all(detachedPromises);
+    await Promise.allSettled(detachedPromises);
   } catch {
     /* the runs' own failures are recorded in their receipts */
   }
