@@ -2,27 +2,26 @@
 
 ## Unreleased
 
-- **Rewrote tool descriptions for LLMs**: descriptions across all five tools and schemas are rewritten in concise, plain language focused on tool selection and argument filling, roughly halving the `tools/list` context payload (~13 KB down to under 6.5 KB). Per-field documentation on `TaskResult` and machine-checked pointers in `CONTRIBUTING.md` replace the redundant prose behavioral reference.
-- **Added `watch_task(wait: true)` to collect a run in one call**: opt-in parameter that awaits settlement of a detached (`background: true`) run and returns its complete final result in a single call without polling round trips.
-- `watch_task(wait: true)` returns immediately on an already finished run, awaits in-flight runs owned by this process via the delegations registry, and refuses runs in flight owned by another server process with an informative error envelope directing callers to poll.
-- `watch_task` refuses the combination of `cancel: true` and `wait: true` as contradictory and redundant.
-- `watch_task` input schema adds the optional `wait` boolean parameter.
+### Breaking changes
 
-- **Concurrent delegations are now allowed**: any number of `general_task` and `explore_task` calls may run concurrently; a second delegation is no longer refused (`another delegation is already running` is removed).
-- Each concurrent run executes as an independent child process with its own transcript file and final result.
+This release is a minor bump: the following changes what a caller observes.
+
+- **Concurrent delegations are allowed: the "one delegation at a time" refusal is gone.** Any number of `general_task` and `explore_task` calls may now run concurrently - a second delegation is no longer rejected with `another delegation is already running`, and each run is an independent child process with its own transcript and result. *Migration: if you relied on the server serializing delegations - e.g. firing several calls and expecting only one to run - they now all run in parallel and share your model quota; there is no concurrency cap, the ceiling is your machine and your account.*
+- **Added `watch_task(wait: true)` to collect a run in one call.** An opt-in parameter that awaits a run's settlement and returns its complete final result in a single call, without polling - the natural shape for a fan-out: start N detached runs, then await N collects. It returns immediately for an already finished run, refuses the combination with `cancel: true` as contradictory, and cannot await a run owned by another server process (refused with an error envelope directing you to poll).
+- **The tool descriptions are rewritten for the agents that call them**, roughly halving the `tools/list` context payload (~12.6 KB down to 6.4 KB). The schema structure is unchanged - text only - and the tools-list golden is regenerated to pin it.
 - `watch_task(cancel: true)` now acts on the run named by the caller via `stream_file` or task ID; cancelling without `stream_file` when multiple runs are in flight is safely ignored with an ambiguity hint.
 - The shutdown drain now awaits every in-flight detached (`background: true`) run on client disconnect so every receipt is written.
 - Concurrent delegations sharing a working tree in a git repository now carry an `audit_note` explaining that `files_touched` and `scope_violations` may reflect changes from other concurrent runs.
 - Cancelling a detached run via `notifications/cancelled` no longer removes its registry entry before the child settles, ensuring the cancellation receipt is written even if the client disconnects immediately.
 - `watch_task(cancel: true)` without a `stream_file` when exactly one delegation is in flight now returns the report for the cancelled delegation rather than resolving the newest transcript by file modification time.
 - The ambiguity hint for `watch_task(cancel: true)` when multiple delegations are in flight is now always attached even if the transcript resolved by `watch_task` was already finished.
-
+- The documentation now has one owner per fact: `TaskResult` field comments replace the prose behavioral reference in CONTRIBUTING, which now points at the code (the type, the constants, the goldens, the test suite's own summary lines).
 
 ## 0.3.0 - 2026-10-21
 
 ### Breaking changes
 
-This release is a minor bump: the following change what a caller observes.
+This release is a minor bump: the following changes what a caller observes.
 
 - **Unknown argument keys are refused.** A call carrying a key that is not in the tool's `inputSchema` used to be accepted and the key ignored; it is an error now and nothing is spawned. *Migration: send only the keys the tool's `inputSchema` declares.*
 - **Wrong-typed arguments are refused**, including `null` for an optional argument — a mistyped value used to be silently dropped (so `auto_approve: "true"` silently meant **false**). *Migration: omit an optional argument you do not want instead of sending `null` or `""`.*
